@@ -1,7 +1,7 @@
-Proton BM
+Proton-BM
 =========
 
-Bemani-focused patches for Proton-CachyOS.
+Proton-BM adds Bemani-focused patches to [Proton-CachyOS](https://github.com/CachyOS/proton-cachyos).
 
 > [!WARNING]
 > # it's experimental AI slop!

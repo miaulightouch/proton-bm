@@ -1,4 +1,8 @@
-# Proton BM workspace instructions
+# Proton-BM workspace instructions
+
+## Project shorthands
+
+- `%pjsync`: fetch the latest published release from `upstream`, create or reuse the corresponding upstream branch with `cachyos` replaced by `bm`, merge the release tag, and check, migrate or fix the Bemani patches. Run the relevant builds and tests.
 
 ## Project scope
 
@@ -10,3 +14,5 @@
 - Keep feature support and API limitations in `README.md`, and build/test records under ignored `local/`. Do not put implementation status, test results or work history in `AGENTS.md`.
 - Distinguish automated regression tests from physical input verification; claim support only within the verified scope.
 - Keep the original project remote as `upstream` and the personal fork as `origin`. Push fork changes to `origin`; do not push them to `upstream`.
+- Name branches and release tags by replacing `cachyos` in the corresponding upstream names with `bm`.
+- Use `Proton-BM` for fork branding; identify CachyOS only as the upstream source.
