@@ -14,5 +14,6 @@
 - Keep feature support and API limitations in `README.md`, and build/test records under ignored `local/`. Do not put implementation status, test results or work history in `AGENTS.md`.
 - Distinguish automated regression tests from physical input verification; claim support only within the verified scope.
 - Keep the original project remote as `upstream` and the personal fork as `origin`. Push fork changes to `origin`; do not push them to `upstream`.
-- Name branches and release tags by replacing `cachyos` in the corresponding upstream names with `bm`.
+- Name branches by replacing `cachyos` in the corresponding upstream names with `bm`.
+- Use `bm-<upstream-version>-<bm-revision>-slr` for release tags. Start the BM revision at `1` for each upstream version and increment it for BM updates.
 - Use `Proton-BM` for fork branding; identify CachyOS only as the upstream source.

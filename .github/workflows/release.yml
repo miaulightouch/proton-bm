@@ -53,7 +53,7 @@ jobs:
       shell: bash
       run: |
         git fetch origin +refs/tags/*:refs/tags/*
-        python -c "v='${{ github.ref_name }}'.split('-');print('title='+'-'.join([v[1],v[2]]))" >> "$GITHUB_OUTPUT"
+        python -c "v='${{ github.ref_name }}'.split('-');print('title='+'-'.join(v[1:-1]))" >> "$GITHUB_OUTPUT"
     - name: Create
       id: create
       shell: bash
