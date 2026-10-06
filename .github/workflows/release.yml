@@ -3,9 +3,9 @@ name: Release
 on:
   release:
     types: [ published ]
-
-permissions:
-  contents: read
+  push:
+    tags:
+      - 'bm-*-*-slr'
 
 concurrency:
   group: ${{ github.ref_name }}
@@ -39,11 +39,38 @@ jobs:
       runner: ${{ matrix.runner != '' && matrix.runner || 'ubuntu-24.04' }}
       continue: false
 
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-slim
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+    - name: Title
+      id: title
+      shell: bash
+      run: |
+        git fetch origin +refs/tags/*:refs/tags/*
+        python -c "v='${{ github.ref_name }}'.split('-');print('title='+'-'.join([v[1],v[2]]))" >> "$GITHUB_OUTPUT"
+    - name: Create
+      id: create
+      shell: bash
+      run: >-
+        gh
+        release create
+        ${{ github.ref_name }}
+        --latest
+        --title "Version ${{ steps.title.outputs.title }}"
+        --notes-from-tag
+        --verify-tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   upload:
     name: Upload
-    needs: build
-    permissions:
-      contents: write
+    needs: release
     strategy:
       matrix:
         include:
