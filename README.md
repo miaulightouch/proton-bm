@@ -1,3 +1,20 @@
+Proton BM
+=========
+
+Bemani-focused patches for Proton-CachyOS.
+
+> [!WARNING]
+> # it's experimental AI slop!
+> author can't even understand the codes.
+
+## Added features
+
+- Multitouch: native Win8 pointer API support.
+
+Physical multitouch is confirmed with 32-bit Spice on XWayland and native Wayland;
+other architectures still need physical confirmation. History contains one frame;
+touch injection, gestures and extended device queries are not implemented by this patch.
+
 Introduction
 ------------
 

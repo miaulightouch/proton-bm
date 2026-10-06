@@ -1,0 +1,1576 @@
+diff --git a/configure.ac b/configure.ac
+index f6a9db8..5cef54c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3481,6 +3481,7 @@ WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winevulkan)
+ WINE_CONFIG_MAKEFILE(dlls/winewayland.drv)
++WINE_CONFIG_MAKEFILE(dlls/winewayland.drv/tests)
+ WINE_CONFIG_MAKEFILE(dlls/winex11.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winexinput.sys)
+ WINE_CONFIG_MAKEFILE(dlls/wing.dll16)
+@@ -3788,6 +3789,20 @@ WINE_CONFIG_MAKEFILE(tools/wmc)
+ WINE_CONFIG_MAKEFILE(tools/wrc)
+ dnl End of auto-generated output commands
+ 
++
++dnl Rules for the native Wayland touch tests
++
++case " $DISABLED_SUBDIRS " in
++  *" dlls/winewayland.drv/tests "*) ;;
++  *" dlls/winewayland.drv "*)
++    AS_VAR_APPEND([DISABLED_SUBDIRS],[" dlls/winewayland.drv/tests"]) ;;
++  *) WINE_APPEND_RULE(
++[check test: dlls/winewayland.drv/tests/check
++dlls/winewayland.drv/tests/check dlls/winewayland.drv/tests/test: dlls/winewayland.drv/tests/touch_test
++	./dlls/winewayland.drv/tests/touch_test
++.PHONY: dlls/winewayland.drv/tests/check dlls/winewayland.drv/tests/test]) ;;
++esac
++
+ dnl Main ignore file
+ 
+ WINE_IGNORE_FILE(TAGS)
+diff --git a/dlls/win32u/tests/Makefile.in b/dlls/win32u/tests/Makefile.in
+index e668c84..c31c805 100644
+--- a/dlls/win32u/tests/Makefile.in
++++ b/dlls/win32u/tests/Makefile.in
+@@ -3,4 +3,5 @@ IMPORTS   = imm32 user32 gdi32 dwmapi setupapi opengl32 d3d9 dxgi d3d10 d3d11 d3
+ 
+ SOURCES = \
+ 	d3dkmt.c \
++	touch.c \
+ 	win32u.c
+diff --git a/dlls/win32u/tests/touch.c b/dlls/win32u/tests/touch.c
+new file mode 100644
+index 0000000..7a20c97
+--- /dev/null
++++ b/dlls/win32u/tests/touch.c
+@@ -0,0 +1,1220 @@
++/*
++ * Windows touch input tests.
++ *
++ * Copyright 2026
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++
++#include "wine/test.h"
++
++#include "winbase.h"
++#include "ntuser.h"
++
++#include <string.h>
++
++#define MAX_POINTER_EVENTS 128
++#define FRAME_HISTORY_ROWS 8
++#define FRAME_HISTORY_COLUMNS 8
++
++enum test_phase
++{
++    PHASE_NONE,
++    PHASE_POINTER_DOWN,
++    PHASE_POINTER_UPDATE,
++    PHASE_POINTER_UP_FIRST,
++    PHASE_POINTER_HOLD,
++    PHASE_POINTER_UP_LAST,
++    PHASE_TARGET_POPUP_DOWN,
++    PHASE_TARGET_POPUP_UPDATE,
++    PHASE_TARGET_POPUP_UP,
++    PHASE_TARGET_PARENT_DOWN,
++};
++
++struct pointer_event
++{
++    unsigned int phase;
++    UINT message;
++    UINT id;
++    BOOL info_ok;
++    DWORD error;
++    POINTER_TOUCH_INFO info;
++};
++
++static struct pointer_event pointer_events[MAX_POINTER_EVENTS];
++static unsigned int pointer_event_count;
++static unsigned int current_phase;
++static BOOL check_up_history_in_window_proc;
++
++static void check_pointer_history( UINT id, BOOL expect_two_frame_pointers );
++
++static int clamp_int( int value, int low, int high )
++{
++    if ( value < low ) return low;
++    if ( value > high ) return high;
++    return value;
++}
++
++/* Convert a physical screen point to the normalized LPARAM consumed by the
++ * WM_POINTER path.  The source driver and the server both use the virtual
++ * screen rectangle, including a negative virtual-screen origin. */
++static LPARAM normalized_point( POINT point )
++{
++    int left = GetSystemMetrics( SM_XVIRTUALSCREEN );
++    int top = GetSystemMetrics( SM_YVIRTUALSCREEN );
++    int width = GetSystemMetrics( SM_CXVIRTUALSCREEN );
++    int height = GetSystemMetrics( SM_CYVIRTUALSCREEN );
++    int x, y;
++
++    if ( width < 2 ) width = 2;
++    if ( height < 2 ) height = 2;
++    x = clamp_int( point.x, left, left + width - 1 );
++    y = clamp_int( point.y, top, top + height - 1 );
++    x = (int)( (long long)( x - left ) * 65535 / ( width - 1 ) );
++    y = (int)( (long long)( y - top ) * 65535 / ( height - 1 ) );
++    return MAKELPARAM( (WORD)clamp_int( x, 0, 65535 ), (WORD)clamp_int( y, 0, 65535 ) );
++}
++
++static BOOL send_pointer( HWND hwnd, UINT message, UINT id, UINT flags, POINT point )
++{
++    INPUT input;
++    BOOL ret;
++
++    memset( &input, 0, sizeof( input ) );
++    input.type = INPUT_HARDWARE;
++    input.hi.uMsg = message;
++    input.hi.wParamL = (WORD)id;
++    input.hi.wParamH = (WORD)flags;
++
++    SetLastError( ERROR_SUCCESS );
++    ret = NtUserSendHardwareInput( hwnd, 0, &input, normalized_point( point ) ) == 0;
++    ok( ret, "NtUserSendHardwareInput(%#x,id=%u) failed, error %lu\n", message, id,
++        (unsigned long)GetLastError() );
++    return ret;
++}
++
++static BOOL near_screen_point( const POINT *actual, POINT expected )
++{
++    LONG dx = actual->x - expected.x;
++    LONG dy = actual->y - expected.y;
++
++    if ( dx < 0 ) dx = -dx;
++    if ( dy < 0 ) dy = -dy;
++    return dx <= 3 && dy <= 3;
++}
++
++static void record_pointer_message( UINT message, WPARAM wparam )
++{
++    struct pointer_event *event;
++    UINT id = GET_POINTERID_WPARAM( wparam );
++
++    if ( pointer_event_count >= ARRAY_SIZE( pointer_events ) )
++    {
++        ok( FALSE, "too many pointer messages\n" );
++        return;
++    }
++
++    event = &pointer_events[pointer_event_count++];
++    memset( event, 0, sizeof( *event ) );
++    event->phase = current_phase;
++    event->message = message;
++    event->id = id;
++    SetLastError( ERROR_SUCCESS );
++    event->info_ok = GetPointerTouchInfo( id, &event->info );
++    event->error = GetLastError();
++    ok( event->info_ok, "GetPointerTouchInfo(%u) in WM_POINTER message failed, error %lu\n", id,
++        (unsigned long)event->error );
++
++    /* PM_NOREMOVE must not cause the server's current pointer snapshot to
++     * advance.  Query the message-scoped record twice while the message is
++     * still being dispatched and require the frame ID to stay stable. */
++    if ( event->info_ok )
++    {
++        POINTER_TOUCH_INFO repeated;
++        BOOL repeated_ok;
++        DWORD repeated_error;
++
++        memset( &repeated, 0, sizeof( repeated ) );
++        SetLastError( ERROR_SUCCESS );
++        repeated_ok = GetPointerTouchInfo( id, &repeated );
++        repeated_error = GetLastError();
++        ok( repeated_ok, "second GetPointerTouchInfo(%u) in WM_POINTER message failed, error %lu\n",
++            id, (unsigned long)repeated_error );
++        if ( repeated_ok )
++        {
++            ok( repeated.pointerInfo.frameId == event->info.pointerInfo.frameId,
++                "pointer %u frame ID changed from %lu to %lu while message was queued\n", id,
++                (unsigned long)event->info.pointerInfo.frameId,
++                (unsigned long)repeated.pointerInfo.frameId );
++            ok( repeated.pointerInfo.pointerId == event->info.pointerInfo.pointerId,
++                "pointer %u ID changed from %u to %u while message was queued\n", id,
++                repeated.pointerInfo.pointerId, event->info.pointerInfo.pointerId );
++        }
++    }
++
++    /* The pointer/frame APIs are message-scoped.  Check the final pointer's
++     * history while WM_POINTERUP is still the current message; after the
++     * corresponding LEAVE has been retrieved, ERROR_NO_DATA is permitted. */
++    if ( check_up_history_in_window_proc && message == WM_POINTERUP && id == 3 )
++    {
++        check_pointer_history( id, FALSE );
++        check_up_history_in_window_proc = FALSE;
++    }
++}
++
++static BOOL same_queued_message( const MSG *first, const MSG *second )
++{
++    return first->hwnd == second->hwnd && first->message == second->message &&
++           first->wParam == second->wParam && first->lParam == second->lParam;
++}
++
++static BOOL is_pointer_message( UINT message )
++{
++    return message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP;
++}
++
++static BOOL read_pointer_frame_id( const MSG *message, const char *stage, UINT32 *frame_id )
++{
++    POINTER_TOUCH_INFO info;
++    UINT id = GET_POINTERID_WPARAM( message->wParam );
++    BOOL ret;
++
++    memset( &info, 0, sizeof( info ) );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerTouchInfo( id, &info );
++    ok( ret, "GetPointerTouchInfo(%u) after %s failed, error %lu\n", id, stage,
++        (unsigned long)GetLastError() );
++    if ( !ret ) return FALSE;
++    *frame_id = info.pointerInfo.frameId;
++    ok( *frame_id != 0, "pointer %u has zero frame ID after %s\n", id, stage );
++    return TRUE;
++}
++
++/* Peek the same queue entry twice without removing it, then remove it and
++ * verify that the message delivered to the window is stable in the fields
++ * carrying pointer IDs and coordinates. */
++static BOOL remove_message_after_peek( UINT minimum, UINT maximum, MSG *removed )
++{
++    MSG first, repeated;
++    UINT32 first_frame_id = 0, repeated_frame_id = 0, removed_frame_id = 0;
++    BOOL pointer_message, first_frame_ok = FALSE, repeated_frame_ok = FALSE,
++                          removed_frame_ok = FALSE;
++
++    if ( !PeekMessageA( &first, NULL, minimum, maximum, PM_NOREMOVE ) ) return FALSE;
++    pointer_message = is_pointer_message( first.message );
++    if ( pointer_message )
++        first_frame_ok = read_pointer_frame_id( &first, "the first PM_NOREMOVE", &first_frame_id );
++
++    if ( !PeekMessageA( &repeated, NULL, minimum, maximum, PM_NOREMOVE ) )
++    {
++        ok( FALSE, "second PM_NOREMOVE failed for queued message %#x\n", first.message );
++        return FALSE;
++    }
++    ok( same_queued_message( &first, &repeated ),
++        "repeated PM_NOREMOVE changed message %#x (wParam %#lx lParam %#lx) to (wParam %#lx lParam "
++        "%#lx)\n",
++        first.message, (unsigned long)first.wParam, (unsigned long)first.lParam,
++        (unsigned long)repeated.wParam, (unsigned long)repeated.lParam );
++    if ( pointer_message )
++    {
++        repeated_frame_ok =
++            read_pointer_frame_id( &repeated, "the repeated PM_NOREMOVE", &repeated_frame_id );
++        if ( first_frame_ok && repeated_frame_ok )
++            ok( first_frame_id == repeated_frame_id,
++                "pointer %u frame ID changed across PM_NOREMOVE (%lu to %lu)\n",
++                GET_POINTERID_WPARAM( first.wParam ), (unsigned long)first_frame_id,
++                (unsigned long)repeated_frame_id );
++    }
++
++    if ( !PeekMessageA( removed, NULL, minimum, maximum, PM_REMOVE ) )
++    {
++        ok( FALSE, "PM_REMOVE failed after PM_NOREMOVE for queued message %#x\n", first.message );
++        return FALSE;
++    }
++    ok( same_queued_message( &first, removed ),
++        "PM_REMOVE changed message %#x (wParam %#lx lParam %#lx) to (wParam %#lx lParam %#lx)\n",
++        first.message, (unsigned long)first.wParam, (unsigned long)first.lParam,
++        (unsigned long)removed->wParam, (unsigned long)removed->lParam );
++    if ( pointer_message )
++    {
++        removed_frame_ok = read_pointer_frame_id( removed, "PM_REMOVE", &removed_frame_id );
++        if ( first_frame_ok && removed_frame_ok )
++            ok( first_frame_id == removed_frame_id,
++                "pointer %u frame ID changed from PM_NOREMOVE (%lu) to PM_REMOVE (%lu)\n",
++                GET_POINTERID_WPARAM( first.wParam ), (unsigned long)first_frame_id,
++                (unsigned long)removed_frame_id );
++    }
++    return TRUE;
++}
++
++static void dispatch_checked_message( const MSG *message )
++{
++    unsigned int old_pointer_count = pointer_event_count;
++
++    TranslateMessage( message );
++    DispatchMessageA( message );
++
++    if ( is_pointer_message( message->message ) && pointer_event_count > old_pointer_count )
++    {
++        const struct pointer_event *event = &pointer_events[pointer_event_count - 1];
++
++        ok( event->info.pointerInfo.frameId != 0,
++            "WM_POINTER message %#x delivered a zero frame ID after PM_REMOVE\n",
++            message->message );
++    }
++}
++
++static LRESULT CALLBACK test_window_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam )
++{
++    switch ( message )
++    {
++    case WM_POINTERDOWN:
++    case WM_POINTERUPDATE:
++    case WM_POINTERUP:
++        record_pointer_message( message, wparam );
++        break;
++
++    case WM_TOUCH:
++        ok( FALSE, "unexpected legacy touch message\n" );
++        return 0;
++    }
++
++    return DefWindowProcA( hwnd, message, wparam, lparam );
++}
++
++static void pump_messages( unsigned int phase )
++{
++    MSG msg;
++
++    current_phase = phase;
++    while ( remove_message_after_peek( 0, 0, &msg ) )
++    {
++        if ( msg.message == WM_QUIT )
++        {
++            ok( FALSE, "unexpected WM_QUIT\n" );
++            continue;
++        }
++        dispatch_checked_message( &msg );
++    }
++    current_phase = PHASE_NONE;
++}
++
++static void pump_pointer_messages_only( unsigned int phase )
++{
++    MSG msg;
++
++    current_phase = phase;
++    while ( remove_message_after_peek( WM_POINTERUPDATE, WM_POINTERUP, &msg ) )
++    {
++        dispatch_checked_message( &msg );
++    }
++    current_phase = PHASE_NONE;
++}
++
++static struct pointer_event *find_pointer_event( unsigned int phase, UINT message, UINT id )
++{
++    unsigned int i;
++
++    for ( i = 0; i < pointer_event_count; ++i )
++    {
++        if ( pointer_events[i].phase == phase && pointer_events[i].message == message &&
++             pointer_events[i].id == id )
++            return &pointer_events[i];
++    }
++    return NULL;
++}
++
++static void check_pointer_event( unsigned int phase, UINT message, UINT id, POINT expected,
++                                 UINT required_flags, UINT forbidden_flags )
++{
++    struct pointer_event *event = find_pointer_event( phase, message, id );
++
++    ok( event != NULL, "missing WM_POINTER message %#x for id %u in phase %u\n", message, id,
++        phase );
++    if ( !event || !event->info_ok ) return;
++
++    ok( event->info.pointerInfo.pointerType == PT_TOUCH,
++        "pointer %u type is %lu, expected PT_TOUCH\n", id,
++        (unsigned long)event->info.pointerInfo.pointerType );
++    ok( event->info.pointerInfo.pointerId == id, "pointer ID is %u, expected %u\n",
++        event->info.pointerInfo.pointerId, id );
++    ok( ( event->info.pointerInfo.pointerFlags & required_flags ) == required_flags,
++        "pointer %u flags %#x lack %#x\n", id, event->info.pointerInfo.pointerFlags,
++        required_flags );
++    ok( !( event->info.pointerInfo.pointerFlags & forbidden_flags ),
++        "pointer %u flags %#x unexpectedly contain %#x\n", id, event->info.pointerInfo.pointerFlags,
++        forbidden_flags );
++    ok( near_screen_point( &event->info.pointerInfo.ptPixelLocation, expected ),
++        "pointer %u location is %ld,%ld, expected %ld,%ld\n", id,
++        (long)event->info.pointerInfo.ptPixelLocation.x,
++        (long)event->info.pointerInfo.ptPixelLocation.y, (long)expected.x, (long)expected.y );
++    ok( event->info.pointerInfo.historyCount != 0, "pointer %u has empty history\n", id );
++    ok( event->info.pointerInfo.frameId != 0, "pointer %u has frame ID zero\n", id );
++}
++
++static BOOL frame_contains( const POINTER_TOUCH_INFO *frame, UINT count, UINT id, BOOL *in_contact )
++{
++    UINT i;
++
++    for ( i = 0; i < count; ++i )
++    {
++        if ( frame[i].pointerInfo.pointerId == id )
++        {
++            if ( in_contact )
++                *in_contact = !!( frame[i].pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT );
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++static void check_pointer_history( UINT id, BOOL expect_two_frame_pointers )
++{
++    POINTER_TOUCH_INFO history[8], frame_history[FRAME_HISTORY_ROWS * FRAME_HISTORY_COLUMNS];
++    struct
++    {
++        POINTER_TOUCH_INFO values[2 * FRAME_HISTORY_COLUMNS];
++        DWORD guard;
++    } limited;
++    UINT32 count = ARRAY_SIZE( history ), entries = 0, pointers = 0;
++    UINT32 total_entries, total_pointers;
++    UINT32 row_capacity, column_capacity;
++    BOOL ret;
++    unsigned int i;
++
++    memset( history, 0, sizeof( history ) );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerTouchInfoHistory( id, &count, history );
++    ok( ret, "GetPointerTouchInfoHistory(%u) failed, error %lu\n", id,
++        (unsigned long)GetLastError() );
++    if ( ret ) ok( count != 0, "GetPointerTouchInfoHistory(%u) returned zero records\n", id );
++
++    /* Query the required matrix dimensions first.  The API explicitly allows
++     * a NULL buffer for a zero-by-zero query and returns the required counts. */
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfoHistory( id, &entries, &pointers, NULL );
++    ok( ret, "GetPointerFrameTouchInfoHistory(%u) size query failed, error %lu\n", id,
++        (unsigned long)GetLastError() );
++    if ( !ret ) return;
++    total_entries = entries;
++    total_pointers = pointers;
++    ok( total_entries != 0, "frame history for %u reports zero entries\n", id );
++    ok( total_pointers != 0, "frame history for %u reports zero pointers\n", id );
++    if ( expect_two_frame_pointers )
++        ok( total_pointers >= 2, "frame history for %u has %u pointers\n", id, total_pointers );
++
++    /* The output array is [rows][columns].  Keep both dimensions bounded so
++     * a long retained history cannot overrun this test. */
++    row_capacity = total_entries < FRAME_HISTORY_ROWS ? total_entries : FRAME_HISTORY_ROWS;
++    column_capacity =
++        total_pointers < FRAME_HISTORY_COLUMNS ? total_pointers : FRAME_HISTORY_COLUMNS;
++    entries = row_capacity;
++    pointers = column_capacity;
++    memset( frame_history, 0, sizeof( frame_history ) );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfoHistory( id, &entries, &pointers, frame_history );
++    ok( ret, "GetPointerFrameTouchInfoHistory(%u) failed, error %lu\n", id,
++        (unsigned long)GetLastError() );
++    if ( ret )
++    {
++        ok( entries == total_entries, "frame history for %u reports %u entries, expected %u\n", id,
++            entries, total_entries );
++        ok( pointers == total_pointers, "frame history for %u reports %u pointers, expected %u\n",
++            id, pointers, total_pointers );
++    }
++
++    /* A short row buffer is still a successful query.  Only the first row
++     * (with all available columns) may be copied, while entriesCount returns
++     * the total number of available rows. */
++    if ( total_pointers <= FRAME_HISTORY_COLUMNS )
++    {
++        memset( &limited, 0xcd, sizeof( limited ) );
++        limited.guard = 0x544f5548; /* "TOUH" */
++        entries = 1;
++        pointers = FRAME_HISTORY_COLUMNS;
++        SetLastError( ERROR_SUCCESS );
++        ret = GetPointerFrameTouchInfoHistory( id, &entries, &pointers, limited.values );
++        ok( ret, "limited-row frame history for %u failed, error %lu\n", id,
++            (unsigned long)GetLastError() );
++        if ( ret )
++        {
++            ok( entries == total_entries,
++                "limited-row history for %u reports %u entries, expected %u\n", id, entries,
++                total_entries );
++            ok( pointers == total_pointers,
++                "limited-row history for %u reports %u pointers, expected %u\n", id, pointers,
++                total_pointers );
++        }
++        for ( i = FRAME_HISTORY_COLUMNS; i < ARRAY_SIZE( limited.values ); ++i )
++        {
++            const unsigned char *bytes = (const unsigned char *)&limited.values[i];
++            unsigned int j;
++            for ( j = 0; j < sizeof( limited.values[i] ); ++j )
++                ok( bytes[j] == 0xcd, "limited-row history copied beyond its one-row capacity\n" );
++        }
++        ok( limited.guard == 0x544f5548, "limited-row frame history corrupted its guard\n" );
++    }
++}
++
++static void check_pointer_buffer_validation( UINT id )
++{
++    struct
++    {
++        POINTER_TOUCH_INFO value;
++        DWORD guard;
++    } one;
++    UINT32 count;
++    BOOL ret;
++
++    memset( &one, 0xcd, sizeof( one ) );
++    one.guard = 0x544f5550; /* "TOUP" */
++    count = 1;
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( id, &count, &one.value );
++    ok( !ret, "GetPointerFrameTouchInfo(%u) accepted a one-entry buffer for two contacts\n", id );
++    ok( count >= 2, "insufficient frame buffer reported count %u, expected at least 2\n", count );
++    ok( one.guard == 0x544f5550, "insufficient frame buffer corrupted its guard\n" );
++
++    count = 2;
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( id, &count, NULL );
++    ok( !ret, "GetPointerFrameTouchInfo(%u) accepted a NULL result buffer\n", id );
++
++    count = 0;
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( id, &count, NULL );
++    ok( ret, "GetPointerFrameTouchInfo(%u) zero-capacity query failed, error %lu\n", id,
++        (unsigned long)GetLastError() );
++    if ( ret )
++        ok( count >= 2, "zero-capacity frame query returned count %u, expected at least 2\n",
++            count );
++
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerTouchInfo( id, NULL );
++    ok( !ret, "GetPointerTouchInfo(%u) accepted a NULL result buffer\n", id );
++}
++
++static void test_capabilities(void)
++{
++    int digitizer = GetSystemMetrics( SM_DIGITIZER );
++    int maximum = GetSystemMetrics( SM_MAXIMUMTOUCHES );
++    UINT32 count = 0, capacity;
++    POINTER_DEVICE_INFO devices[4];
++    BOOL ret;
++
++    if ( !( digitizer & NID_INTEGRATED_TOUCH ) || maximum <= 0 )
++    {
++        skip( "touch device capability queries unavailable\n" );
++        return;
++    }
++
++    trace( "SM_DIGITIZER=%#x SM_MAXIMUMTOUCHES=%d\n", digitizer, maximum );
++    ok( digitizer & NID_INTEGRATED_TOUCH, "SM_DIGITIZER=%#x lacks NID_INTEGRATED_TOUCH\n",
++        digitizer );
++    ok( digitizer & NID_MULTI_INPUT, "SM_DIGITIZER=%#x lacks NID_MULTI_INPUT\n", digitizer );
++    ok( digitizer & NID_READY, "SM_DIGITIZER=%#x lacks NID_READY\n", digitizer );
++    ok( maximum > 0, "SM_MAXIMUMTOUCHES=%d\n", maximum );
++
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerDevices( &count, NULL );
++    ok( ret, "GetPointerDevices(NULL) failed, error %lu\n", (unsigned long)GetLastError() );
++    ok( count == 1, "GetPointerDevices(NULL) returned %u devices, expected 1\n", count );
++
++    memset( devices, 0, sizeof( devices ) );
++    capacity = ARRAY_SIZE( devices );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerDevices( &capacity, devices );
++    ok( ret, "GetPointerDevices(array) failed, error %lu\n", (unsigned long)GetLastError() );
++    if ( ret )
++    {
++        ok( capacity == 1, "GetPointerDevices(array) returned %u devices, expected 1\n", capacity );
++        ok( devices[0].pointerDeviceType == POINTER_DEVICE_TYPE_TOUCH,
++            "device type is %u, expected touch\n", devices[0].pointerDeviceType );
++    }
++
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerDevices( NULL, devices );
++    ok( !ret, "GetPointerDevices accepted a NULL device-count pointer\n" );
++}
++
++static void test_pointer_path( HWND hwnd, POINT first, POINT second )
++{
++    POINTER_TOUCH_INFO info[4];
++    UINT32 count;
++    POINTER_INPUT_TYPE type;
++    BOOL ret;
++    unsigned int i;
++
++    pointer_event_count = 0;
++    memset( pointer_events, 0, sizeof( pointer_events ) );
++
++    /* Buffer two independent contacts before pumping the window queue. */
++    send_pointer( hwnd, WM_POINTERDOWN, 2,
++                  POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
++                      POINTER_MESSAGE_FLAG_INCONTACT,
++                  first );
++    send_pointer( hwnd, WM_POINTERDOWN, 3,
++                  POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
++                      POINTER_MESSAGE_FLAG_INCONTACT,
++                  second );
++    pump_messages( PHASE_POINTER_DOWN );
++
++    check_pointer_event( PHASE_POINTER_DOWN, WM_POINTERDOWN, 2, first,
++                         POINTER_FLAG_NEW | POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE |
++                             POINTER_FLAG_INCONTACT | POINTER_FLAG_PRIMARY,
++                         0 );
++    check_pointer_event( PHASE_POINTER_DOWN, WM_POINTERDOWN, 3, second,
++                         POINTER_FLAG_NEW | POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE |
++                             POINTER_FLAG_INCONTACT,
++                         POINTER_FLAG_PRIMARY );
++
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerType( 2, &type );
++    ok( ret && type == PT_TOUCH, "GetPointerType(2) returned %d/type %lu, error %lu\n", ret,
++        (unsigned long)type, (unsigned long)GetLastError() );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerType( 3, &type );
++    ok( ret && type == PT_TOUCH, "GetPointerType(3) returned %d/type %lu, error %lu\n", ret,
++        (unsigned long)type, (unsigned long)GetLastError() );
++
++    memset( info, 0, sizeof( info ) );
++    count = ARRAY_SIZE( info );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( 2, &count, info );
++    ok( ret, "GetPointerFrameTouchInfo(2) failed after two downs, error %lu\n",
++        (unsigned long)GetLastError() );
++    if ( ret )
++    {
++        BOOL in_contact;
++        ok( count == 2, "down frame has %u pointers, expected 2\n", count );
++        ok( frame_contains( info, count, 2, &in_contact ) && in_contact,
++            "down frame lacks active pointer 2\n" );
++        ok( frame_contains( info, count, 3, &in_contact ) && in_contact,
++            "down frame lacks active pointer 3\n" );
++    }
++    check_pointer_history( 2, TRUE );
++    check_pointer_buffer_validation( 2 );
++
++    /* Move both contacts independently, again before pumping. */
++    first.x += 17;
++    first.y += 11;
++    second.x -= 19;
++    second.y += 13;
++    send_pointer( hwnd, WM_POINTERUPDATE, 2,
++                  POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT, first );
++    send_pointer( hwnd, WM_POINTERUPDATE, 3,
++                  POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT, second );
++    pump_messages( PHASE_POINTER_UPDATE );
++    check_pointer_event( PHASE_POINTER_UPDATE, WM_POINTERUPDATE, 2, first,
++                         POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
++                             POINTER_FLAG_PRIMARY,
++                         0 );
++    check_pointer_event( PHASE_POINTER_UPDATE, WM_POINTERUPDATE, 3, second,
++                         POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
++                         POINTER_FLAG_PRIMARY );
++
++    /* Lift pointer 2 while pointer 3 remains down. */
++    send_pointer( hwnd, WM_POINTERUP, 2, POINTER_MESSAGE_FLAG_INRANGE, first );
++    pump_messages( PHASE_POINTER_UP_FIRST );
++    check_pointer_event( PHASE_POINTER_UP_FIRST, WM_POINTERUP, 2, first,
++                         POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_FLAG_INCONTACT );
++
++    /* The remaining contact gets a frame of its own; pointer 2 must not be
++     * resurrected as an active contact. */
++    send_pointer( hwnd, WM_POINTERUPDATE, 3,
++                  POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT, second );
++    pump_messages( PHASE_POINTER_HOLD );
++    memset( info, 0, sizeof( info ) );
++    count = ARRAY_SIZE( info );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( 3, &count, info );
++    ok( ret, "GetPointerFrameTouchInfo(3) failed while pointer 3 remained down, error %lu\n",
++        (unsigned long)GetLastError() );
++    if ( ret )
++    {
++        BOOL in_contact;
++        ok( count == 1, "held frame has %u pointers, expected 1\n", count );
++        ok( !frame_contains( info, count, 2, NULL ), "held frame retained stale pointer 2\n" );
++        ok( frame_contains( info, count, 3, &in_contact ) && in_contact,
++            "held frame lacks active pointer 3\n" );
++    }
++    check_pointer_history( 3, FALSE );
++
++    check_up_history_in_window_proc = TRUE;
++    send_pointer( hwnd, WM_POINTERUP, 3, POINTER_MESSAGE_FLAG_INRANGE, second );
++    pump_messages( PHASE_POINTER_UP_LAST );
++    ok( !check_up_history_in_window_proc,
++        "pointer 3 history was not queried during WM_POINTERUP\n" );
++    check_pointer_event( PHASE_POINTER_UP_LAST, WM_POINTERUP, 3, second,
++                         POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_FLAG_INCONTACT );
++
++    /* A final frame may expose the UP record as history, but it must not
++     * expose an active contact after both fingers have been lifted. */
++    memset( info, 0, sizeof( info ) );
++    count = ARRAY_SIZE( info );
++    SetLastError( ERROR_SUCCESS );
++    ret = GetPointerFrameTouchInfo( 3, &count, info );
++    if ( ret )
++    {
++        ok( count <= ARRAY_SIZE( info ), "final frame returned oversized count %u\n", count );
++        for ( i = 0; i < count && i < ARRAY_SIZE( info ); ++i )
++            ok( !( info[i].pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT ),
++                "final frame retains active contact for pointer %u\n",
++                info[i].pointerInfo.pointerId );
++    }
++    else
++    {
++        ok( GetLastError() == ERROR_NO_DATA,
++            "GetPointerFrameTouchInfo(3) after final UP failed with %lu, expected ERROR_NO_DATA\n",
++            (unsigned long)GetLastError() );
++    }
++}
++
++struct native_target_record
++{
++    UINT id;
++    BOOL info_ok;
++    DWORD error;
++    POINTER_TOUCH_INFO info;
++};
++
++struct native_target_state
++{
++    HANDLE ready;
++    HANDLE message_event;
++    HANDLE thread;
++    HWND owner;
++    HWND hwnd;
++    RECT popup_rect;
++    DWORD thread_id;
++    DWORD create_error;
++    LONG down_count;
++    LONG update_count;
++    LONG up_count;
++    struct native_target_record down;
++    struct native_target_record up;
++    CRITICAL_SECTION lock;
++    BOOL lock_initialized;
++    struct native_target_record update_records[MAX_POINTER_EVENTS];
++    UINT update_record_count;
++};
++
++static struct native_target_state *native_target_active;
++static const char native_target_class[] = "wine_touch_native_target_popup";
++
++static void native_target_record( struct native_target_state *state, UINT message, WPARAM wparam )
++{
++    struct native_target_record record = {0};
++    UINT update_index;
++
++    record.id = GET_POINTERID_WPARAM( wparam );
++    SetLastError( ERROR_SUCCESS );
++    record.info_ok = GetPointerTouchInfo( record.id, &record.info );
++    record.error = GetLastError();
++
++    EnterCriticalSection( &state->lock );
++    switch ( message )
++    {
++    case WM_POINTERDOWN:
++        state->down = record;
++        InterlockedIncrement( &state->down_count );
++        break;
++    case WM_POINTERUPDATE:
++        update_index = state->update_record_count++;
++        if ( update_index < ARRAY_SIZE( state->update_records ) )
++            state->update_records[update_index] = record;
++        InterlockedIncrement( &state->update_count );
++        break;
++    case WM_POINTERUP:
++        state->up = record;
++        InterlockedIncrement( &state->up_count );
++        break;
++    }
++    LeaveCriticalSection( &state->lock );
++    SetEvent( state->message_event );
++}
++
++static LRESULT CALLBACK native_target_wndproc( HWND hwnd, UINT message, WPARAM wparam,
++                                               LPARAM lparam )
++{
++    struct native_target_state *state = native_target_active;
++
++    switch ( message )
++    {
++    case WM_POINTERDOWN:
++    case WM_POINTERUPDATE:
++    case WM_POINTERUP:
++        if ( state ) native_target_record( state, message, wparam );
++        return 0;
++
++    case WM_NCHITTEST:
++        return HTCLIENT;
++
++    case WM_ERASEBKGND:
++    {
++        RECT rect;
++
++        GetClientRect( hwnd, &rect );
++        FillRect( (HDC)wparam, &rect, GetSysColorBrush( COLOR_WINDOW ) );
++        return 1;
++    }
++
++    case WM_PAINT:
++    {
++        PAINTSTRUCT paint;
++
++        BeginPaint( hwnd, &paint );
++        EndPaint( hwnd, &paint );
++        return 0;
++    }
++    }
++
++    return DefWindowProcA( hwnd, message, wparam, lparam );
++}
++
++static DWORD WINAPI native_target_thread( void *arg )
++{
++    struct native_target_state *state = arg;
++    MSG message;
++
++    state->thread_id = GetCurrentThreadId();
++    state->hwnd = CreateWindowExA( WS_EX_LAYERED, native_target_class, "touch target", WS_POPUP,
++                                   state->popup_rect.left, state->popup_rect.top,
++                                   state->popup_rect.right - state->popup_rect.left,
++                                   state->popup_rect.bottom - state->popup_rect.top, state->owner,
++                                   NULL, GetModuleHandleA( NULL ), NULL );
++    if ( !state->hwnd )
++    {
++        state->create_error = GetLastError();
++        SetEvent( state->ready );
++        return 0;
++    }
++
++    if ( !SetLayeredWindowAttributes( state->hwnd, RGB( 255, 0, 255 ), 0, LWA_COLORKEY ) )
++    {
++        state->create_error = GetLastError();
++        DestroyWindow( state->hwnd );
++        state->hwnd = NULL;
++        SetEvent( state->ready );
++        return 0;
++    }
++
++    ShowWindow( state->hwnd, SW_SHOWNOACTIVATE );
++    RedrawWindow( state->hwnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME );
++    UpdateWindow( state->hwnd );
++    SetEvent( state->ready );
++
++    while ( GetMessageA( &message, NULL, 0, 0 ) > 0 )
++    {
++        TranslateMessage( &message );
++        DispatchMessageA( &message );
++    }
++
++    if ( state->hwnd )
++    {
++        DestroyWindow( state->hwnd );
++        state->hwnd = NULL;
++    }
++    return 0;
++}
++
++static BOOL native_target_start( struct native_target_state *state, HWND owner, const RECT *rect )
++{
++    memset( state, 0, sizeof( *state ) );
++    InitializeCriticalSection( &state->lock );
++    state->lock_initialized = TRUE;
++    state->owner = owner;
++    state->popup_rect = *rect;
++    state->ready = CreateEventA( NULL, TRUE, FALSE, NULL );
++    state->message_event = CreateEventA( NULL, TRUE, FALSE, NULL );
++    if ( !state->ready || !state->message_event )
++    {
++        ok( FALSE, "CreateEvent for native target failed, error %lu\n",
++            (unsigned long)GetLastError() );
++        if ( state->ready ) CloseHandle( state->ready );
++        if ( state->message_event ) CloseHandle( state->message_event );
++        state->ready = state->message_event = NULL;
++        DeleteCriticalSection( &state->lock );
++        state->lock_initialized = FALSE;
++        return FALSE;
++    }
++
++    native_target_active = state;
++    state->thread = CreateThread( NULL, 0, native_target_thread, state, 0, NULL );
++    if ( !state->thread )
++    {
++        ok( FALSE, "CreateThread for native target failed, error %lu\n",
++            (unsigned long)GetLastError() );
++        native_target_active = NULL;
++        CloseHandle( state->ready );
++        CloseHandle( state->message_event );
++        state->ready = state->message_event = NULL;
++        DeleteCriticalSection( &state->lock );
++        state->lock_initialized = FALSE;
++        return FALSE;
++    }
++
++    if ( WaitForSingleObject( state->ready, 5000 ) != WAIT_OBJECT_0 )
++    {
++        ok( FALSE, "native target thread did not become ready\n" );
++        return FALSE;
++    }
++    if ( !state->hwnd )
++    {
++        ok( FALSE, "native target popup creation failed, error %lu\n",
++            (unsigned long)state->create_error );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void native_target_stop( struct native_target_state *state )
++{
++    if ( state->thread )
++    {
++        if ( WaitForSingleObject( state->thread, 0 ) != WAIT_OBJECT_0 )
++            PostThreadMessageA( state->thread_id, WM_QUIT, 0, 0 );
++        if ( WaitForSingleObject( state->thread, 5000 ) != WAIT_OBJECT_0 )
++            ok( FALSE, "native target thread did not stop\n" );
++        CloseHandle( state->thread );
++    }
++    if ( state->ready ) CloseHandle( state->ready );
++    if ( state->message_event ) CloseHandle( state->message_event );
++    state->ready = state->message_event = NULL;
++    native_target_active = NULL;
++    if ( state->lock_initialized )
++    {
++        DeleteCriticalSection( &state->lock );
++        state->lock_initialized = FALSE;
++    }
++}
++
++static BOOL native_target_info_matches( const POINTER_TOUCH_INFO *info, BOOL info_ok, UINT stored_id,
++                                        DWORD error, UINT id, POINT expected, UINT required_flags,
++                                        UINT forbidden_flags )
++{
++    ok( info_ok, "native target GetPointerTouchInfo(%u) failed, error %lu\n", stored_id,
++        (unsigned long)error );
++    if ( !info_ok ) return FALSE;
++    ok( stored_id == id, "native target message used pointer %u, expected %u\n", stored_id, id );
++    if ( stored_id != id ) return FALSE;
++    ok( info->pointerInfo.pointerType == PT_TOUCH, "native target pointer type is %lu\n",
++        (unsigned long)info->pointerInfo.pointerType );
++    ok( ( info->pointerInfo.pointerFlags & required_flags ) == required_flags,
++        "native target pointer %#x flags %#x lack %#x\n", id, info->pointerInfo.pointerFlags,
++        required_flags );
++    ok( !( info->pointerInfo.pointerFlags & forbidden_flags ),
++        "native target pointer %#x flags %#x unexpectedly contain %#x\n", id,
++        info->pointerInfo.pointerFlags, forbidden_flags );
++    ok( near_screen_point( &info->pointerInfo.ptPixelLocation, expected ),
++        "native target pointer %#x location is %ld,%ld, expected %ld,%ld\n", id,
++        (long)info->pointerInfo.ptPixelLocation.x, (long)info->pointerInfo.ptPixelLocation.y,
++        (long)expected.x, (long)expected.y );
++    return info->pointerInfo.pointerType == PT_TOUCH &&
++        ( info->pointerInfo.pointerFlags & required_flags ) == required_flags &&
++        !( info->pointerInfo.pointerFlags & forbidden_flags ) &&
++        near_screen_point( &info->pointerInfo.ptPixelLocation, expected );
++}
++
++static BOOL native_target_has_match_locked( struct native_target_state *state, UINT message, UINT id,
++                                            POINT expected, UINT required_flags,
++                                            UINT forbidden_flags )
++{
++    UINT i;
++
++    if ( message == WM_POINTERUPDATE )
++    {
++        for ( i = 0; i < state->update_record_count && i < ARRAY_SIZE( state->update_records ); ++i )
++        {
++            const struct native_target_record *record = &state->update_records[i];
++            if ( record->id == id && record->info_ok &&
++                 ( record->info.pointerInfo.pointerFlags & required_flags ) == required_flags &&
++                 !( record->info.pointerInfo.pointerFlags & forbidden_flags ) &&
++                 record->info.pointerInfo.pointerType == PT_TOUCH &&
++                 near_screen_point( &record->info.pointerInfo.ptPixelLocation, expected ) )
++                return TRUE;
++        }
++        return FALSE;
++    }
++
++    if ( message == WM_POINTERDOWN )
++        return state->down_count && native_target_info_matches( &state->down.info,
++            state->down.info_ok, state->down.id, state->down.error, id, expected, required_flags,
++            forbidden_flags );
++    return state->up_count && native_target_info_matches( &state->up.info, state->up.info_ok,
++        state->up.id, state->up.error, id, expected, required_flags, forbidden_flags );
++}
++
++static BOOL native_target_wait( struct native_target_state *state, UINT message, UINT id,
++                                POINT expected, UINT required_flags, UINT forbidden_flags )
++{
++    DWORD start = GetTickCount();
++
++    for ( ;; )
++    {
++        DWORD elapsed;
++
++        EnterCriticalSection( &state->lock );
++        if ( native_target_has_match_locked( state, message, id, expected, required_flags,
++                                             forbidden_flags ) )
++        {
++            LeaveCriticalSection( &state->lock );
++            return TRUE;
++        }
++        LeaveCriticalSection( &state->lock );
++        elapsed = GetTickCount() - start;
++        if ( elapsed >= 5000 ) return FALSE;
++        if ( WaitForSingleObject( state->message_event, 5000 - elapsed ) != WAIT_OBJECT_0 )
++            return FALSE;
++        ResetEvent( state->message_event );
++    }
++}
++
++static void native_target_check( struct native_target_state *state, UINT message, UINT id,
++                                 POINT expected, UINT required_flags, UINT forbidden_flags )
++{
++    struct native_target_record record = {0};
++    BOOL found = FALSE;
++    UINT i;
++    LONG actual_count;
++
++    EnterCriticalSection( &state->lock );
++    if ( message == WM_POINTERDOWN )
++    {
++        actual_count = state->down_count;
++        record = state->down;
++        found = actual_count == 1;
++    }
++    else if ( message == WM_POINTERUPDATE )
++    {
++        actual_count = state->update_count;
++        for ( i = 0; i < state->update_record_count && i < ARRAY_SIZE( state->update_records ); ++i )
++        {
++            const struct native_target_record *update = &state->update_records[i];
++            if ( update->id != id || !update->info_ok ||
++                 update->info.pointerInfo.pointerType != PT_TOUCH ||
++                 ( update->info.pointerInfo.pointerFlags & required_flags ) != required_flags ||
++                 ( update->info.pointerInfo.pointerFlags & forbidden_flags ) ||
++                 !near_screen_point( &update->info.pointerInfo.ptPixelLocation, expected ) )
++                continue;
++            record = *update;
++            found = TRUE;
++            break;
++        }
++    }
++    else
++    {
++        actual_count = state->up_count;
++        record = state->up;
++        found = actual_count == 1;
++    }
++    LeaveCriticalSection( &state->lock );
++
++    if ( message == WM_POINTERUPDATE )
++        ok( actual_count >= 1, "native target received no WM_POINTERUPDATE messages\n" );
++    else
++        ok( actual_count == 1, "native target received %ld messages %#x, expected one\n", actual_count,
++            message );
++    ok( found, "native target did not capture the expected %#x for pointer %u\n", message, id );
++    if ( !found ) return;
++    ok( record.info_ok, "native target GetPointerTouchInfo(%u) failed, error %lu\n", record.id,
++        (unsigned long)record.error );
++    if ( !record.info_ok ) return;
++    ok( record.id == id, "native target message %#x used pointer %u, expected %u\n", message,
++        record.id, id );
++    ok( record.info.pointerInfo.hwndTarget == state->hwnd,
++        "native target query returned hwndTarget %p, expected popup %p\n",
++        record.info.pointerInfo.hwndTarget, state->hwnd );
++    native_target_info_matches( &record.info, record.info_ok, record.id, record.error, id, expected,
++                                required_flags, forbidden_flags );
++}
++
++static void native_target_check_no_parent( UINT id )
++{
++    unsigned int i;
++
++    for ( i = 0; i < pointer_event_count; ++i )
++        ok( pointer_events[i].id != id,
++            "pointer %u unexpectedly reached the parent window as message %#x\n", id,
++            pointer_events[i].message );
++}
++
++static void test_native_hardware_target( HWND owner, const RECT *owner_rect, HINSTANCE instance )
++{
++    struct native_target_state state;
++    WNDCLASSA popup_class;
++    RECT popup_rect;
++    POINT inside, outside;
++    struct pointer_event *parent_event;
++    LONG width = owner_rect->right - owner_rect->left;
++    LONG height = owner_rect->bottom - owner_rect->top;
++    BOOL got;
++
++    memset( &popup_class, 0, sizeof( popup_class ) );
++    popup_class.lpfnWndProc = native_target_wndproc;
++    popup_class.hInstance = instance;
++    popup_class.hbrBackground = GetSysColorBrush( COLOR_WINDOW );
++    popup_class.lpszClassName = native_target_class;
++    ok( RegisterClassA( &popup_class ) != 0, "RegisterClassA(native target) failed, error %lu\n",
++        (unsigned long)GetLastError() );
++
++    popup_rect.left = owner_rect->left + width / 3;
++    popup_rect.top = owner_rect->top + height / 3;
++    popup_rect.right = popup_rect.left + ( width > 240 ? 120 : width / 3 );
++    popup_rect.bottom = popup_rect.top + ( height > 240 ? 120 : height / 3 );
++    inside.x = ( popup_rect.left + popup_rect.right ) / 2;
++    inside.y = ( popup_rect.top + popup_rect.bottom ) / 2;
++    outside.x = owner_rect->left + 8;
++    outside.y = owner_rect->top + 8;
++
++    if ( !native_target_start( &state, owner, &popup_rect ) )
++    {
++        native_target_stop( &state );
++        UnregisterClassA( native_target_class, instance );
++        return;
++    }
++
++    pointer_event_count = 0;
++    memset( pointer_events, 0, sizeof( pointer_events ) );
++
++    /* X11 touch events enter win32u with no explicit window.  The server
++     * must hit-test the DOWN point, then retain that target through UP. */
++    send_pointer( NULL, WM_POINTERDOWN, 60,
++                  POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
++                      POINTER_MESSAGE_FLAG_INCONTACT,
++                  inside );
++    got = native_target_wait( &state, WM_POINTERDOWN, 60, inside,
++                              POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT, 0 );
++    ok( got, "native target did not receive WM_POINTERDOWN\n" );
++    pump_messages( PHASE_TARGET_POPUP_DOWN );
++    native_target_check_no_parent( 60 );
++    if ( got )
++        native_target_check( &state, WM_POINTERDOWN, 60, inside,
++                             POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT, 0 );
++
++    send_pointer( NULL, WM_POINTERUPDATE, 60,
++                  POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT, outside );
++    got = native_target_wait( &state, WM_POINTERUPDATE, 60, outside,
++                              POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT, 0 );
++    ok( got, "native target did not receive captured WM_POINTERUPDATE\n" );
++    pump_messages( PHASE_TARGET_POPUP_UPDATE );
++    native_target_check_no_parent( 60 );
++    if ( got )
++        native_target_check( &state, WM_POINTERUPDATE, 60, outside,
++                             POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
++                             0 );
++
++    send_pointer( NULL, WM_POINTERUP, 60, POINTER_MESSAGE_FLAG_INRANGE, outside );
++    got = native_target_wait( &state, WM_POINTERUP, 60, outside,
++                              POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_FLAG_INCONTACT );
++    ok( got, "native target did not receive captured WM_POINTERUP\n" );
++    pump_messages( PHASE_TARGET_POPUP_UP );
++    native_target_check_no_parent( 60 );
++    if ( got )
++        native_target_check( &state, WM_POINTERUP, 60, outside,
++                             POINTER_FLAG_UP | POINTER_FLAG_INRANGE, POINTER_FLAG_INCONTACT );
++
++    ResetEvent( state.message_event );
++    pointer_event_count = 0;
++    memset( pointer_events, 0, sizeof( pointer_events ) );
++    send_pointer( NULL, WM_POINTERDOWN, 61,
++                  POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
++                      POINTER_MESSAGE_FLAG_INCONTACT,
++                  outside );
++    pump_messages( PHASE_TARGET_PARENT_DOWN );
++    parent_event = find_pointer_event( PHASE_TARGET_PARENT_DOWN, WM_POINTERDOWN, 61 );
++    ok( parent_event != NULL, "subsequent outside WM_POINTERDOWN did not reach the parent\n" );
++    if ( parent_event && parent_event->info_ok )
++    {
++        ok( parent_event->info.pointerInfo.hwndTarget == owner,
++            "parent query returned hwndTarget %p, expected parent %p\n",
++            parent_event->info.pointerInfo.hwndTarget, owner );
++        ok( near_screen_point( &parent_event->info.pointerInfo.ptPixelLocation, outside ),
++            "parent pointer location is %ld,%ld, expected %ld,%ld\n",
++            (long)parent_event->info.pointerInfo.ptPixelLocation.x,
++            (long)parent_event->info.pointerInfo.ptPixelLocation.y, (long)outside.x,
++            (long)outside.y );
++    }
++    Sleep( 100 );
++    ok( InterlockedCompareExchange( &state.down_count, 0, 0 ) == 1,
++        "subsequent outside WM_POINTERDOWN reached the popup\n" );
++
++    send_pointer( NULL, WM_POINTERUP, 61, POINTER_MESSAGE_FLAG_INRANGE, outside );
++    pump_messages( PHASE_TARGET_PARENT_DOWN );
++    native_target_stop( &state );
++    UnregisterClassA( native_target_class, instance );
++}
++
++START_TEST( touch )
++{
++    WNDCLASSA cls;
++    HWND hwnd;
++    RECT rect;
++    POINT first, second;
++    HINSTANCE instance = GetModuleHandleA( NULL );
++    int left, top, width, height;
++
++    if ( !winetest_platform_is_wine )
++    {
++        win_skip( "NtUserSendHardwareInput is a Wine private API\n" );
++        return;
++    }
++    test_capabilities();
++
++    memset( &cls, 0, sizeof( cls ) );
++    cls.lpfnWndProc = test_window_proc;
++    cls.hInstance = instance;
++    cls.lpszClassName = "wine_touch_regression_window";
++    ok( RegisterClassA( &cls ) != 0, "RegisterClassA failed, error %lu\n",
++        (unsigned long)GetLastError() );
++
++    left = GetSystemMetrics( SM_XVIRTUALSCREEN );
++    top = GetSystemMetrics( SM_YVIRTUALSCREEN );
++    width = GetSystemMetrics( SM_CXVIRTUALSCREEN );
++    height = GetSystemMetrics( SM_CYVIRTUALSCREEN );
++    if ( width < 320 ) width = 320;
++    if ( height < 240 ) height = 240;
++    if ( width > 640 ) width = 640;
++    if ( height > 480 ) height = 480;
++
++    hwnd = CreateWindowExA( 0, cls.lpszClassName, "Wine touch regression", WS_POPUP | WS_VISIBLE,
++                            left + 16, top + 16, width, height, NULL, NULL, instance, NULL );
++    ok( hwnd != NULL, "CreateWindowExA failed, error %lu\n", GetLastError() );
++    if ( !hwnd ) return;
++
++    ShowWindow( hwnd, SW_SHOW );
++    UpdateWindow( hwnd );
++    SetForegroundWindow( hwnd );
++    SetFocus( hwnd );
++    pump_messages( PHASE_NONE );
++    GetWindowRect( hwnd, &rect );
++    first.x = rect.left + ( rect.right - rect.left ) / 3;
++    first.y = rect.top + ( rect.bottom - rect.top ) / 3;
++    second.x = rect.left + ( rect.right - rect.left ) * 2 / 3;
++    second.y = rect.top + ( rect.bottom - rect.top ) * 2 / 3;
++
++    /* Legacy registration must not convert native pointers in DefWindowProc. */
++    ok( RegisterTouchWindow( hwnd, 0 ), "RegisterTouchWindow failed, error %lu\n", GetLastError() );
++    test_pointer_path( hwnd, first, second );
++    ok( UnregisterTouchWindow( hwnd ), "UnregisterTouchWindow failed, error %lu\n", GetLastError() );
++    test_native_hardware_target( hwnd, &rect, instance );
++
++    DestroyWindow( hwnd );
++    UnregisterClassA( cls.lpszClassName, instance );
++    pump_messages( PHASE_NONE );
++}
+diff --git a/dlls/winewayland.drv/tests/Makefile.in b/dlls/winewayland.drv/tests/Makefile.in
+new file mode 100644
+index 0000000..c3ee484
+--- /dev/null
++++ b/dlls/winewayland.drv/tests/Makefile.in
+@@ -0,0 +1,7 @@
++PROGRAMS = touch_test
++PARENTSRC = ..
++UNIX_CFLAGS = -Idlls/winewayland.drv $(WAYLAND_CLIENT_CFLAGS) $(XKBCOMMON_CFLAGS) $(XKBREGISTRY_CFLAGS) -DWINE_NO_TRACE_MSGS -DWINE_NO_DEBUG_MSGS
++UNIX_LIBS = $(WAYLAND_CLIENT_LIBS) $(XKBCOMMON_LIBS) $(XKBREGISTRY_LIBS) $(PTHREAD_LIBS) -lm
++
++SOURCES = \
++	touch.c
+diff --git a/dlls/winewayland.drv/tests/touch.c b/dlls/winewayland.drv/tests/touch.c
+new file mode 100644
+index 0000000..ab0186a
+--- /dev/null
++++ b/dlls/winewayland.drv/tests/touch.c
+@@ -0,0 +1,276 @@
++/*
++ * Wayland touch callback tests.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "config.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../waylanddrv.h"
++
++struct wayland process_wayland;
++
++static struct wayland_surface fake_surface;
++static struct wayland_win_data fake_data;
++static HWND fake_hwnd = (HWND)(ULONG_PTR)0x1234;
++
++struct sent_event
++{
++    HWND hwnd;
++    INPUT input;
++    LPARAM lparam;
++};
++
++static struct sent_event sent[32];
++static unsigned int sent_count;
++static unsigned int touch_add_count;
++static unsigned int touch_release_count;
++static unsigned int touch_destroy_count;
++
++struct wayland_win_data *wayland_win_data_get( HWND hwnd )
++{
++    return hwnd == fake_hwnd ? &fake_data : NULL;
++}
++
++void wayland_win_data_release( struct wayland_win_data *data )
++{
++}
++
++POINT map_point_from_surface( struct wayland_surface *surface, POINT point )
++{
++    point.x = (LONG)( point.x * surface->window.scale );
++    point.y = (LONG)( point.y * surface->window.scale );
++    return point;
++}
++
++ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR first, ULONG_PTR second, DWORD code )
++{
++    if ( code == NtUserCallTwoParam_GetVirtualScreenRect )
++    {
++        RECT *rect = (RECT *)first;
++        rect->left = -100;
++        rect->top = -50;
++        rect->right = 1820;
++        rect->bottom = 1030;
++    }
++    return 1;
++}
++
++ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
++{
++    struct send_hardware_input_params *params = (struct send_hardware_input_params *)param;
++
++    if ( code == NtUserCallHwndParam_SendHardwareInput && sent_count < ARRAY_SIZE( sent ) )
++    {
++        sent[sent_count].hwnd = hwnd;
++        sent[sent_count].input = *params->input;
++        sent[sent_count].lparam = params->lparam;
++        sent_count++;
++    }
++    return 1;
++}
++
++static void fail( const char *message )
++{
++    fprintf( stderr, "FAIL: %s\n", message );
++    exit( 1 );
++}
++
++static void check( BOOL condition, const char *message )
++{
++    if ( !condition ) fail( message );
++}
++
++static unsigned int sent_flags( unsigned int index )
++{
++    return sent[index].input.hi.wParamH;
++}
++
++static WORD sent_id( unsigned int index )
++{
++    return sent[index].input.hi.wParamL;
++}
++
++static POINT sent_position( unsigned int index )
++{
++    POINT point = { (LONG)(USHORT)LOWORD( sent[index].lparam ),
++                    (LONG)(USHORT)HIWORD( sent[index].lparam ) };
++    return point;
++}
++
++static void *harness_wl_surface_get_user_data( struct wl_surface *surface )
++{
++    return fake_hwnd;
++}
++
++static int harness_wl_touch_add_listener( struct wl_touch *touch,
++                                          const struct wl_touch_listener *listener, void *data )
++{
++    touch_add_count++;
++    return 0;
++}
++
++static uint32_t harness_wl_touch_get_version( struct wl_touch *touch )
++{
++    return 3;
++}
++
++static void harness_wl_touch_release( struct wl_touch *touch )
++{
++    touch_release_count++;
++}
++
++static void harness_wl_touch_destroy( struct wl_touch *touch )
++{
++    touch_destroy_count++;
++}
++
++/* Include the implementation so the test feeds the backend's real static
++ * listener and state helpers instead of reimplementing them. */
++#define wl_surface_get_user_data harness_wl_surface_get_user_data
++#define wl_touch_add_listener harness_wl_touch_add_listener
++#define wl_touch_get_version harness_wl_touch_get_version
++#define wl_touch_release harness_wl_touch_release
++#define wl_touch_destroy harness_wl_touch_destroy
++#include "../wayland_touch.c"
++#undef wl_surface_get_user_data
++#undef wl_touch_add_listener
++#undef wl_touch_get_version
++#undef wl_touch_release
++#undef wl_touch_destroy
++
++int main(void)
++{
++    struct wl_surface *surface = (struct wl_surface *)(ULONG_PTR)0x1111;
++    struct wl_touch *touch = (struct wl_touch *)(ULONG_PTR)0x5678;
++    POINT point;
++
++    memset( &fake_surface, 0, sizeof( fake_surface ) );
++    fake_surface.hwnd = fake_hwnd;
++    fake_surface.wl_surface = surface;
++    fake_surface.window.rect.left = 100;
++    fake_surface.window.rect.top = 50;
++    fake_surface.window.rect.right = 1100;
++    fake_surface.window.rect.bottom = 850;
++    fake_surface.window.scale = 2.0;
++    memset( &fake_data, 0, sizeof( fake_data ) );
++    fake_data.hwnd = fake_hwnd;
++    fake_data.wayland_surface = &fake_surface;
++    pthread_mutex_init( &process_wayland.touch.mutex, NULL );
++    check( !WAYLAND_GetTouchCapabilities(),
++           "touch capability is present before device initialization" );
++    wayland_touch_init( touch );
++    check( touch_add_count == 1, "touch listener was not registered" );
++    check( WAYLAND_GetTouchCapabilities() == 256,
++           "touch capability did not appear after device initialization" );
++
++    touch_listener.down( NULL, touch, 1, 10, surface, 7, wl_fixed_from_int( 100 ),
++                         wl_fixed_from_int( 50 ) );
++    touch_listener.down( NULL, touch, 2, 11, surface, 8, wl_fixed_from_int( 200 ),
++                         wl_fixed_from_int( 100 ) );
++    check( sent_count == 2, "two down callbacks did not emit two events" );
++    check( sent_id( 0 ) == 2 && sent_id( 1 ) == 3,
++           "touch IDs did not start at 2 and remain independent" );
++    check( sent_flags( 0 ) & POINTER_MESSAGE_FLAG_PRIMARY, "first contact is not primary" );
++    check( !( sent_flags( 1 ) & POINTER_MESSAGE_FLAG_PRIMARY ),
++           "second contact is unexpectedly primary" );
++    point = sent_position( 0 );
++    check( point.x == ( 100 * 2 + 100 - ( -100 ) ) * 65535 / 1920 &&
++               point.y == ( 50 * 2 + 50 - ( -50 ) ) * 65535 / 1080,
++           "down coordinate normalization is wrong" );
++
++    touch_listener.motion( NULL, touch, 12, 7, wl_fixed_from_int( 110 ), wl_fixed_from_int( 60 ) );
++    check( sent_count == 3 && sent_id( 2 ) == 2, "motion lost the original contact ID" );
++    check( sent[2].input.hi.uMsg == WM_POINTERUPDATE &&
++               ( sent_flags( 2 ) & POINTER_MESSAGE_FLAG_INCONTACT ),
++           "motion flags are wrong" );
++
++    touch_listener.motion( NULL, touch, 13, 8, wl_fixed_from_int( 210 ), wl_fixed_from_int( 110 ) );
++    check( sent_count == 4 && sent_id( 3 ) == 3, "second motion lost the independent contact ID" );
++    check( sent[3].input.hi.uMsg == WM_POINTERUPDATE &&
++               ( sent_flags( 3 ) & POINTER_MESSAGE_FLAG_INCONTACT ),
++           "second motion flags are wrong" );
++
++    touch_listener.up( NULL, touch, 3, 14, 7 );
++    check( sent_count == 5 && sent_id( 4 ) == 2, "first up lost the original contact ID" );
++    check( sent[4].input.hi.uMsg == WM_POINTERUP &&
++               !( sent_flags( 4 ) & POINTER_MESSAGE_FLAG_INCONTACT ),
++           "first up retained INCONTACT" );
++
++    touch_listener.up( NULL, touch, 4, 15, 8 );
++    check( sent_count == 6 && sent_id( 5 ) == 3, "second up lost the independent contact ID" );
++    check( sent[5].input.hi.uMsg == WM_POINTERUP &&
++               !( sent_flags( 5 ) & POINTER_MESSAGE_FLAG_INCONTACT ),
++           "second up retained INCONTACT" );
++    check( !process_wayland.touch.contacts, "individual up did not remove both contacts" );
++
++    touch_listener.down( NULL, touch, 5, 16, surface, 9, wl_fixed_from_int( 1 ),
++                         wl_fixed_from_int( 2 ) );
++    touch_listener.down( NULL, touch, 6, 17, surface, 10, wl_fixed_from_int( 2 ),
++                         wl_fixed_from_int( 3 ) );
++    check( sent_count == 8 && sent_id( 6 ) == 4 && sent_id( 7 ) == 5,
++           "second two-contact sequence did not allocate independent IDs" );
++    touch_listener.cancel( NULL, touch );
++    check( sent_count == 10 && !process_wayland.touch.contacts,
++           "cancel did not release both active contacts" );
++    check( sent[8].input.hi.uMsg == WM_POINTERUP && sent[9].input.hi.uMsg == WM_POINTERUP &&
++               ( sent_flags( 8 ) & POINTER_MESSAGE_FLAG_CANCELED ) &&
++               ( sent_flags( 9 ) & POINTER_MESSAGE_FLAG_CANCELED ) &&
++               !( sent_flags( 8 ) & POINTER_MESSAGE_FLAG_INCONTACT ) &&
++               !( sent_flags( 9 ) & POINTER_MESSAGE_FLAG_INCONTACT ),
++           "cancel flags are wrong" );
++
++    touch_listener.down( NULL, touch, 7, 18, surface, 11, wl_fixed_from_int( 1 ),
++                         wl_fixed_from_int( 2 ) );
++    check( sent_count == 11 && sent_id( 10 ) == 6,
++           "new contact ID was not stable after cancellation" );
++    wayland_touch_clear_surface( fake_hwnd );
++    check( sent_count == 12 && sent_id( 11 ) == 6 && !process_wayland.touch.contacts,
++           "surface cleanup did not release contact" );
++    check( sent[11].input.hi.uMsg == WM_POINTERUP &&
++               ( sent_flags( 11 ) & POINTER_MESSAGE_FLAG_CANCELED ),
++           "surface cleanup flags are wrong" );
++
++    wayland_touch_deinit();
++    check( !process_wayland.touch.wl_touch && !WAYLAND_GetTouchCapabilities(),
++           "touch capability did not disappear after device removal" );
++    check( touch_release_count == 1 && !touch_destroy_count,
++           "device removal did not release the versioned touch object" );
++
++    wayland_touch_init( touch );
++    check( WAYLAND_GetTouchCapabilities() == 256,
++           "touch capability did not return after device reinitialization" );
++    touch_listener.down( NULL, touch, 8, 19, surface, 12, wl_fixed_from_int( 3 ),
++                         wl_fixed_from_int( 4 ) );
++    check( sent_count == 13 && sent_id( 12 ) == 2,
++           "reinitialized device did not reset pointer IDs" );
++    wayland_touch_deinit();
++    check( sent_count == 14 && sent_id( 13 ) == 2 && !process_wayland.touch.contacts,
++           "device removal did not cancel the active contact" );
++    check( sent[13].input.hi.uMsg == WM_POINTERUP &&
++               ( sent_flags( 13 ) & POINTER_MESSAGE_FLAG_CANCELED ),
++           "device removal cancellation flags are wrong" );
++    check( !process_wayland.touch.wl_touch && !WAYLAND_GetTouchCapabilities() &&
++               touch_release_count == 2,
++           "device capability remained present after the second removal" );
++
++    pthread_mutex_destroy( &process_wayland.touch.mutex );
++    puts( "wayland touch callback harness: PASS" );
++    return 0;
++}
+diff --git a/tools/makedep.c b/tools/makedep.c
+index 56c918c..6c26f89 100644
+--- a/tools/makedep.c
++++ b/tools/makedep.c
+@@ -1608,6 +1608,7 @@ static struct file *open_include_file( const struct makefile *make, struct incl_
+     /* try in src file directory */
+     if ((file = open_same_dir_generated_file( make, pFile->included_by, pFile, ".tab.h", ".y" )) ||
+         (file = open_same_dir_generated_file( make, pFile->included_by, pFile, ".h", ".idl" )) ||
++        (file = open_same_dir_generated_file( make, pFile->included_by, pFile, "-client-protocol.h", ".xml" )) ||
+         (file = open_file_same_dir( pFile->included_by, pFile->name, &pFile->filename )))
+     {
+         pFile->is_external = pFile->included_by->is_external;

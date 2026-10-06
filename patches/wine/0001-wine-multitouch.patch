@@ -1,0 +1,2352 @@
+diff --git a/dlls/user32/input.c b/dlls/user32/input.c
+index 5654a29..9c74c50 100644
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -837,16 +837,20 @@ BOOL WINAPI GetPointerDeviceRects( HANDLE device, RECT *device_rect, RECT *displ
+ 
+ BOOL WINAPI GetPointerPenInfo( UINT32 id, POINTER_PEN_INFO *info )
+ {
+-    FIXME( "id %u, info %p stub!\n", id, info );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    UINT32 count = 1;
++
++    TRACE( "id %u, info %p\n", id, info );
++
++    return NtUserGetPointerInfoList( id, PT_PEN, 0, 0, sizeof(*info), &count, &count, info );
+ }
+ 
+ BOOL WINAPI GetPointerTouchInfo( UINT32 id, POINTER_TOUCH_INFO *info )
+ {
+-    FIXME( "id %u, info %p stub!\n", id, info );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    UINT32 count = 1;
++
++    TRACE( "id %u, info %p stub!\n", id, info );
++
++    return NtUserGetPointerInfoList( id, PT_TOUCH, 0, 0, sizeof(*info), &count, &count, info );
+ }
+ 
+ BOOL WINAPI GetRawPointerDeviceData( UINT32 id, UINT32 hist_count, UINT32 prop_count,
+@@ -860,16 +864,52 @@ BOOL WINAPI GetRawPointerDeviceData( UINT32 id, UINT32 hist_count, UINT32 prop_c
+ 
+ BOOL WINAPI GetPointerTouchInfoHistory( UINT32 id, UINT32 *count, POINTER_TOUCH_INFO *info )
+ {
+-    FIXME( "id %u, count %p, info %p stub!\n", id, count, info );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    UINT32 pointers = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_TOUCH, 2, 0, sizeof(*info), count, &pointers, info );
+ }
+ 
+-BOOL WINAPI GetPointerInfoHistory( UINT32 id, UINT32 *count, POINTER_INFO *info )
++BOOL WINAPI GetPointerPenInfoHistory( UINT32 id, UINT32 *count, POINTER_PEN_INFO *info )
+ {
+-    FIXME( "id %u, count %p, info %p stub.\n", id, count, info );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    UINT32 pointers = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_PEN, 0, 0, sizeof(*info), count, &pointers, info );
++}
++
++BOOL WINAPI GetPointerFrameTouchInfo( UINT32 id, UINT32 *count, POINTER_TOUCH_INFO *info )
++{
++    UINT32 entries = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_TOUCH, 1, 0, sizeof(*info), &entries, count, info );
++}
++
++BOOL WINAPI GetPointerFramePenInfo( UINT32 id, UINT32 *count, POINTER_PEN_INFO *info )
++{
++    UINT32 entries = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_PEN, 0, 0, sizeof(*info), &entries, count, info );
++}
++
++BOOL WINAPI GetPointerFrameTouchInfoHistory( UINT32 id, UINT32 *entries, UINT32 *pointers,
++                                             POINTER_TOUCH_INFO *info )
++{
++    TRACE( "id %u, entries %p, pointers %p, info %p\n", id, entries, pointers, info );
++    return NtUserGetPointerInfoList( id, PT_TOUCH, 3, 0, sizeof(*info), entries, pointers, info );
++}
++
++BOOL WINAPI GetPointerFramePenInfoHistory( UINT32 id, UINT32 *entries, UINT32 *pointers,
++                                           POINTER_PEN_INFO *info )
++{
++    TRACE( "id %u, entries %p, pointers %p, info %p\n", id, entries, pointers, info );
++    return NtUserGetPointerInfoList( id, PT_PEN, 0, 0, sizeof(*info), entries, pointers, info );
+ }
+ 
+ BOOL WINAPI SkipPointerFrameMessages( UINT32 id )
+diff --git a/dlls/user32/misc.c b/dlls/user32/misc.c
+index 3b3cde9..d9512f7 100644
+--- a/dlls/user32/misc.c
++++ b/dlls/user32/misc.c
+@@ -527,10 +527,36 @@ BOOL WINAPI GetPointerType(UINT32 id, POINTER_INPUT_TYPE *type)
+ 
+ BOOL WINAPI GetPointerInfo(UINT32 id, POINTER_INFO *info)
+ {
+-    FIXME("(%d %p): stub\n", id, info);
++    UINT32 count = 1;
+ 
+-    SetLastError(ERROR_INVALID_PARAMETER);
+-    return FALSE;
++    TRACE( "id %d, info %p\n", id, info );
++
++    return NtUserGetPointerInfoList( id, PT_POINTER, 0, 0, sizeof(*info), &count, &count, info );
++}
++
++BOOL WINAPI GetPointerInfoHistory( UINT32 id, UINT32 *count, POINTER_INFO *info )
++{
++    UINT32 pointers = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_POINTER, 2, 0, sizeof(*info), count, &pointers, info );
++}
++
++BOOL WINAPI GetPointerFrameInfo( UINT32 id, UINT32 *count, POINTER_INFO *info )
++{
++    UINT32 entries = 1;
++
++    TRACE( "id %u, count %p, info %p\n", id, count, info );
++
++    return NtUserGetPointerInfoList( id, PT_POINTER, 1, 0, sizeof(*info), &entries, count, info );
++}
++
++BOOL WINAPI GetPointerFrameInfoHistory( UINT32 id, UINT32 *entries, UINT32 *pointers,
++                                        POINTER_INFO *info )
++{
++    TRACE( "id %u, entries %p, pointers %p, info %p\n", id, entries, pointers, info );
++    return NtUserGetPointerInfoList( id, PT_POINTER, 3, 0, sizeof(*info), entries, pointers, info );
+ }
+ 
+ LRESULT WINAPI ImeWndProcA( HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam )
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index 95cef39..83c7c0b 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -630,23 +630,23 @@
+ # @ stub GetPointerDeviceInputSpace
+ # @ stub GetPointerDeviceOrientation
+ @ stdcall GetPointerDeviceProperties(ptr ptr ptr)
+-@ stdcall GetPointerDeviceRects(ptr ptr ptr)
+-@ stdcall GetPointerDevices(ptr ptr)
+-# @ stub GetPointerFrameInfo
+-# @ stub GetPointerFrameInfoHistory
+-# @ stub GetPointerFramePenInfo
+-# @ stub GetPointerFramePenInfoHistory
++@ stdcall GetPointerDeviceRects(ptr ptr ptr) NtUserGetPointerDeviceRects
++@ stdcall GetPointerDevices(ptr ptr) NtUserGetPointerDevices
++@ stdcall GetPointerFrameInfo(long ptr ptr)
++@ stdcall GetPointerFrameInfoHistory(long ptr ptr ptr)
++@ stdcall GetPointerFramePenInfo(long ptr ptr)
++@ stdcall GetPointerFramePenInfoHistory(long ptr ptr ptr)
+ # @ stub GetPointerFrameTimes
+-# @ stub GetPointerFrameTouchInfo
+-# @ stub GetPointerFrameTouchInfoHistory
++@ stdcall GetPointerFrameTouchInfo(long ptr ptr)
++@ stdcall GetPointerFrameTouchInfoHistory(long ptr ptr ptr)
+ @ stdcall GetPointerInfo(long ptr)
+-@ stub GetPointerInfoHistory(long ptr ptr)
++@ stdcall GetPointerInfoHistory(long ptr ptr)
+ # @ stub GetPointerInputTransform
+ @ stdcall GetPointerPenInfo(long ptr)
+-# @ stub GetPointerPenInfoHistory
++@ stdcall GetPointerPenInfoHistory(long ptr ptr)
+ @ stdcall GetPointerTouchInfo(long ptr)
+ @ stdcall GetPointerTouchInfoHistory(long ptr ptr)
+-@ stdcall GetPointerType(long ptr)
++@ stdcall GetPointerType(long ptr) NtUserGetPointerType
+ @ stdcall GetPriorityClipboardFormat(ptr long) NtUserGetPriorityClipboardFormat
+ @ stdcall GetProcessDefaultLayout(ptr)
+ @ stdcall GetProcessDpiAwarenessInternal(long ptr)
+diff --git a/dlls/win32u/defwnd.c b/dlls/win32u/defwnd.c
+index 65e1bf1..286a99f 100644
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -2437,15 +2437,6 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
+     return 0;
+ }
+ 
+-static struct touchinput_thread_data *touch_input_thread_data(void)
+-{
+-    struct user_thread_info *thread_info = get_user_thread_info();
+-    struct touchinput_thread_data *data = thread_info->touchinput;
+-
+-    if (!data) data = thread_info->touchinput = calloc( 1, sizeof(struct touchinput_thread_data) );
+-    return data;
+-}
+-
+ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi )
+ {
+     LRESULT result = 0;
+@@ -3046,62 +3037,8 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+     case WM_POINTERDOWN:
+     case WM_POINTERUP:
+     case WM_POINTERUPDATE:
+-    {
+-        TOUCHINPUT *touches, *end, *touch, *match = NULL;
+-        struct touchinput_thread_data *thread_data;
+-        UINT i;
+-
+         update_mouse_state_from_pointer( hwnd, msg, GET_POINTERID_WPARAM( wparam ) );
+-
+-        if (!NtUserIsTouchWindow( hwnd, NULL )) return 0;
+-        if (!(thread_data = touch_input_thread_data())) return 0;
+-
+-        touches = thread_data->current;
+-        end = touches + ARRAY_SIZE(thread_data->current);
+-        for (touch = touches; touch < end && touch->dwID; touch++)
+-        {
+-            if (touch->dwID == GET_POINTERID_WPARAM( wparam )) match = touch;
+-            touch->dwFlags &= ~TOUCHEVENTF_DOWN;
+-            touch->dwFlags |= TOUCHEVENTF_MOVE;
+-        }
+-        if (match) touch = match;
+-
+-        if (touch == end || (msg != WM_POINTERDOWN && !touch->dwID))
+-        {
+-            if (msg != WM_POINTERDOWN) FIXME("Touch point not found!\n");
+-            else FIXME("Unsupported number of touch points!\n");
+-            break;
+-        }
+-
+-        while (end > (touch + 1) && !(end - 1)->dwID) end--;
+-
+-        touch->x = LOWORD( lparam ) * 100;
+-        touch->y = HIWORD( lparam ) * 100;
+-        touch->hSource = WINE_MOUSE_HANDLE;
+-        touch->dwID = GET_POINTERID_WPARAM( wparam );
+-        touch->dwFlags = 0;
+-        if (msg == WM_POINTERUP) touch->dwFlags |= TOUCHEVENTF_UP;
+-        if (msg == WM_POINTERDOWN) touch->dwFlags |= TOUCHEVENTF_INRANGE | TOUCHEVENTF_DOWN;
+-        if (msg == WM_POINTERUPDATE) touch->dwFlags |= TOUCHEVENTF_INRANGE | TOUCHEVENTF_MOVE;
+-        if (IS_POINTER_PRIMARY_WPARAM( wparam )) touch->dwFlags |= TOUCHEVENTF_PRIMARY;
+-        touch->dwMask = 0;
+-        touch->dwTime = NtGetTickCount();
+-        touch->dwExtraInfo = 0;
+-        touch->cxContact = 0;
+-        touch->cyContact = 0;
+-
+-        i = thread_data->index++ % ARRAY_SIZE(thread_data->history);
+-        memcpy( thread_data->history + i, thread_data->current, sizeof(thread_data->current) );
+-
+-        send_message( hwnd, WM_TOUCH, MAKELONG(end - touches, 0), (LPARAM)i );
+-
+-        if (msg == WM_POINTERUP)
+-        {
+-            while (++touch < end) *(touch - 1) = *touch;
+-            memset( touch - 1, 0, sizeof(*touch) );
+-        }
+-        break;
+-    }
++        return 0;
+ 
+     case WM_TOUCH:
+         /* FIXME: CloseTouchInputHandle( (HTOUCHINPUT)lparam ); */
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 793de3f..f8b72dc 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -1257,6 +1257,12 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
+     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
+ }
+ 
++static UINT loaderdrv_GetTouchCapabilities(void)
++{
++    load_driver();
++    return user_driver->pGetTouchCapabilities ? user_driver->pGetTouchCapabilities() : 0;
++}
++
+ static const struct user_driver_funcs lazy_load_driver =
+ {
+     { NULL },
+@@ -1335,6 +1341,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_OpenGLInit,
+     /* thread management */
+     nulldrv_ThreadDetach,
++    loaderdrv_GetTouchCapabilities,
+ };
+ 
+ const struct user_driver_funcs *user_driver = &lazy_load_driver;
+@@ -1431,6 +1438,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(VulkanInit);
+     SET_USER_FUNC(OpenGLInit);
+     SET_USER_FUNC(ThreadDetach);
++    driver->pGetTouchCapabilities = funcs->pGetTouchCapabilities;
+ #undef SET_USER_FUNC
+ 
+     prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c4398a5..e45b333 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -39,6 +39,7 @@
+ #include "kbd.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
++WINE_DECLARE_DEBUG_CHANNEL(touch);
+ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+ 
+ static const WCHAR keyboard_layouts_keyW[] =
+@@ -405,6 +406,32 @@ static const KBDTABLES kbdus_tables =
+ };
+ 
+ static LONG clipping_cursor; /* clipping thread counter */
++static LONG last_frame = 0;
++
++#define HIMETRIC_PER_INCH 2540
++#define WINE_TOUCH_DEVICE ((HANDLE)(UINT_PTR)0x54554348)
++struct pointer_frame
++{
++    UINT count;
++    POINTER_INFO info[1];
++};
++
++struct pending_pointer_message
++{
++    struct pending_pointer_message *next;
++    UINT hw_id;
++    MSG msg;
++    POINTER_INFO info;
++    struct pointer_frame *frame;
++};
++
++struct pointer
++{
++    UINT32 id;
++    struct list entry;
++    POINTER_INPUT_TYPE type;
++    POINTER_INFO info;
++};
+ 
+ BOOL grab_pointer = TRUE;
+ BOOL grab_fullscreen = FALSE;
+@@ -2840,18 +2867,6 @@ BOOL unregister_touch_window( HWND hwnd )
+     return (win_flags & WIN_IS_TOUCH) != 0;
+ }
+ 
+-/**********************************************************************
+- *       NtUserGetPointerInfoList    (win32u.@)
+- */
+-BOOL WINAPI NtUserGetPointerInfoList( UINT32 id, POINTER_INPUT_TYPE type, UINT_PTR unk0, UINT_PTR unk1, SIZE_T size,
+-                                      UINT32 *entry_count, UINT32 *pointer_count, void *pointer_info )
+-{
+-    FIXME( "id %#x, type %#x, unk0 %#lx, unk1 %#lx, size %#lx, entry_count %p, pointer_count %p, pointer_info %p stub!\n",
+-           id, type, (long)unk0, (long)unk1, size, entry_count, pointer_count, pointer_info );
+-    RtlSetLastWin32Error( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
+-}
+-
+ static BOOL get_clip_cursor( RECT *rect, UINT dpi, MONITOR_DPI_TYPE type )
+ {
+     struct object_lock lock = OBJECT_LOCK_INIT;
+@@ -3023,6 +3038,252 @@ BOOL WINAPI NtUserGetTouchInputInfo( HTOUCHINPUT handle, UINT count, TOUCHINPUT
+     return TRUE;
+ }
+ 
++void destroy_thread_pointers(void)
++{
++    struct user_thread_info *thread_info = get_user_thread_info();
++    struct pointer *pointer, *next;
++    struct pending_pointer_message *pending, *pending_next;
++    free( thread_info->pointer_frames );
++    thread_info->pointer_frames = NULL;
++    for (pending = thread_info->pending_pointer_messages; pending; pending = pending_next)
++    {
++        pending_next = pending->next;
++        free( pending->frame );
++        free( pending );
++    }
++    thread_info->pending_pointer_messages = NULL;
++    LIST_FOR_EACH_ENTRY_SAFE( pointer, next, &thread_info->known_pointers, struct pointer, entry )
++    {
++        list_remove( &pointer->entry );
++        free( pointer );
++    }
++}
++
++static struct pointer *pointer_create( UINT32 id, POINTER_INPUT_TYPE type )
++{
++    struct user_thread_info *thread_info = get_user_thread_info();
++    struct pointer *pointer;
++
++    TRACE( "allocating pointer id %d, type %#x\n", id, type );
++
++    if (!(pointer = calloc( 1, sizeof(*pointer) ))) return NULL;
++    pointer->id = id;
++    pointer->type = type;
++    list_add_tail( &thread_info->known_pointers, &pointer->entry );
++
++    return pointer;
++}
++
++static struct pointer *find_pointer( UINT32 id )
++{
++    struct user_thread_info *thread_info = get_user_thread_info();
++    struct pointer *pointer;
++
++    TRACE( "looking for pointer id %d\n", id );
++
++    LIST_FOR_EACH_ENTRY( pointer, &thread_info->known_pointers, struct pointer, entry )
++        if (pointer->id == id) return pointer;
++
++    WARN( "failed to find pointer with id %d\n", id );
++    return NULL;
++}
++
++static POINTER_INFO pointer_info_from_msg( const MSG *msg )
++{
++    POINT location = { (SHORT)LOWORD( msg->lParam ), (SHORT)HIWORD( msg->lParam ) };
++    LARGE_INTEGER counter;
++    POINTER_INFO info =
++    {
++        .pointerId = GET_POINTERID_WPARAM( msg->wParam ),
++        .sourceDevice = INVALID_HANDLE_VALUE,
++        .frameId = InterlockedIncrement( &last_frame ),
++        .hwndTarget = msg->hwnd,
++        .historyCount = 1,
++        .dwTime = msg->time,
++    };
++
++    info.pointerFlags = HIWORD( msg->wParam );
++    switch (msg->message)
++    {
++    case WM_POINTERUPDATE: info.pointerFlags |= POINTER_FLAG_UPDATE; break;
++    case WM_POINTERDOWN: info.pointerFlags |= POINTER_FLAG_DOWN; break;
++    case WM_POINTERUP:
++        info.pointerFlags = (info.pointerFlags & ~POINTER_FLAG_INCONTACT) | POINTER_FLAG_UP;
++        break;
++    }
++    info.ptPixelLocation = info.ptPixelLocationRaw = location;
++
++    info.ptHimetricLocation.x = location.x * HIMETRIC_PER_INCH / get_system_dpi();
++    info.ptHimetricLocation.y = location.y * HIMETRIC_PER_INCH / get_system_dpi();
++    info.ptHimetricLocationRaw = info.ptHimetricLocation;
++
++    NtQueryPerformanceCounter( &counter, NULL );
++    info.PerformanceCount = counter.QuadPart;
++
++    return info;
++}
++
++static POINTER_BUTTON_CHANGE_TYPE compare_button( const POINTER_INFO *old, const POINTER_INFO *new )
++{
++    POINTER_BUTTON_CHANGE_TYPE change = POINTER_CHANGE_NONE;
++    static const struct
++    {
++        POINTER_FLAGS flag;
++        POINTER_BUTTON_CHANGE_TYPE down, up;
++    } map[] =
++    {
++        { POINTER_FLAG_FIRSTBUTTON, POINTER_CHANGE_FIRSTBUTTON_DOWN, POINTER_CHANGE_FIRSTBUTTON_UP },
++        { POINTER_FLAG_SECONDBUTTON, POINTER_CHANGE_SECONDBUTTON_DOWN, POINTER_CHANGE_SECONDBUTTON_UP },
++        { POINTER_FLAG_THIRDBUTTON, POINTER_CHANGE_THIRDBUTTON_DOWN, POINTER_CHANGE_THIRDBUTTON_UP },
++        { POINTER_FLAG_FOURTHBUTTON, POINTER_CHANGE_FOURTHBUTTON_DOWN, POINTER_CHANGE_FOURTHBUTTON_UP },
++        { POINTER_FLAG_FIFTHBUTTON, POINTER_CHANGE_FIFTHBUTTON_DOWN, POINTER_CHANGE_FIFTHBUTTON_UP },
++    };
++    POINTER_FLAGS down = ~old->pointerFlags & new->pointerFlags, up = old->pointerFlags & ~new->pointerFlags;
++
++    for (size_t i = 0; i < ARRAY_SIZE(map); i++)
++    {
++        if (down & map[i].flag) change |= map[i].down;
++        if (up & map[i].flag) change |= map[i].up;
++    }
++    return change;
++}
++
++static void update_pointer_from_msg( POINTER_INPUT_TYPE type, const MSG *msg )
++{
++    POINTER_INFO info = pointer_info_from_msg( msg );
++    POINTER_BUTTON_CHANGE_TYPE buttons;
++    struct pointer *pointer;
++
++    TRACE( "updating pointer id %d.\n", info.pointerId );
++
++    if (!(pointer = find_pointer( info.pointerId )) && !(pointer = pointer_create( info.pointerId, type ))) return;
++
++    buttons = compare_button( &pointer->info, &info );
++    pointer->info = info;
++    pointer->info.pointerType = pointer->type;
++    if (type == PT_TOUCH) pointer->info.sourceDevice = WINE_TOUCH_DEVICE;
++    pointer->info.ButtonChangeType = buttons;
++}
++
++static BOOL save_pointer_frame( UINT32 changed_id )
++{
++    struct user_thread_info *thread = get_user_thread_info();
++    struct pointer_frame *frame;
++    struct pointer *pointer, *changed = find_pointer( changed_id );
++    UINT count = 0, i = 0;
++
++    if (!changed || changed->type != PT_TOUCH) return TRUE;
++    LIST_FOR_EACH_ENTRY( pointer, &thread->known_pointers, struct pointer, entry )
++        if (pointer->type == PT_TOUCH && pointer->info.hwndTarget == changed->info.hwndTarget &&
++            (pointer == changed || (pointer->info.pointerFlags & POINTER_FLAG_INCONTACT))) count++;
++    if (!(frame = malloc( offsetof(struct pointer_frame, info[count]) ))) return FALSE;
++    frame->count = count;
++    LIST_FOR_EACH_ENTRY( pointer, &thread->known_pointers, struct pointer, entry )
++    {
++        if (pointer->type != PT_TOUCH || pointer->info.hwndTarget != changed->info.hwndTarget ||
++            (pointer != changed && !(pointer->info.pointerFlags & POINTER_FLAG_INCONTACT))) continue;
++        if (pointer != changed)
++        {
++            pointer->info.pointerFlags &= ~(POINTER_FLAG_DOWN | POINTER_FLAG_UP | POINTER_FLAG_NEW);
++            pointer->info.pointerFlags |= POINTER_FLAG_UPDATE;
++        }
++        pointer->info.frameId = changed->info.frameId;
++        frame->info[i++] = pointer->info;
++    }
++    free( thread->pointer_frames );
++    thread->pointer_frames = frame;
++    return TRUE;
++}
++
++static POINTER_INPUT_TYPE pointer_type_from_hw( const struct hw_msg_source *source )
++{
++    switch (source->device)
++    {
++    case IMDT_PEN: return PT_PEN;
++    case IMDT_MOUSE: return PT_MOUSE;
++    case IMDT_TOUCH: return PT_TOUCH;
++    case IMDT_TOUCHPAD: return PT_TOUCHPAD;
++    default: return PT_POINTER;
++    }
++}
++
++/***********************************************************************
++ *          process_pointer_message
++ *
++ * returns TRUE if the contents of 'msg' should be passed to the application
++ */
++BOOL process_pointer_message( MSG *msg, UINT hw_id, const struct hardware_msg_data *msg_data, BOOL remove )
++{
++    struct user_thread_info *thread = get_user_thread_info();
++    struct pending_pointer_message **cursor = (void *)&thread->pending_pointer_messages, *pending;
++    struct pointer *pointer;
++    RECT rect;
++    UINT32 id = GET_POINTERID_WPARAM( msg->wParam );
++
++    while (*cursor && (*cursor)->hw_id != hw_id) cursor = &(*cursor)->next;
++    if ((pending = *cursor))
++    {
++        struct pointer_frame *frame = pending->frame;
++        if (!remove && frame)
++        {
++            SIZE_T size = offsetof(struct pointer_frame, info[pending->frame->count]);
++            if (!(frame = malloc( size ))) return FALSE;
++            memcpy( frame, pending->frame, size );
++        }
++        if (remove) pending->frame = NULL;
++        free( thread->pointer_frames );
++        thread->pointer_frames = frame;
++        pointer = find_pointer( pending->info.pointerId );
++        if (!pointer) pointer = pointer_create( pending->info.pointerId, pending->info.pointerType );
++        if (pointer) pointer->info = pending->info;
++        *msg = pending->msg;
++        if (remove)
++        {
++            *cursor = pending->next;
++            free( pending );
++            if (msg->message == WM_POINTERLEAVE && pointer)
++            {
++                list_remove( &pointer->entry );
++                free( pointer );
++            }
++        }
++        return TRUE;
++    }
++
++    SetRect( &rect, (SHORT)LOWORD( msg->lParam ), (SHORT)HIWORD( msg->lParam ),
++             (SHORT)LOWORD( msg->lParam ), (SHORT)HIWORD( msg->lParam ) );
++    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
++    msg->lParam = MAKELPARAM( rect.left, rect.top );
++    update_pointer_from_msg( pointer_type_from_hw( &msg_data->source ), msg );
++    pointer = find_pointer( id );
++    if (msg->message == WM_POINTERDOWN || msg->message == WM_POINTERUPDATE || msg->message == WM_POINTERUP)
++        if (!save_pointer_frame( id )) return FALSE;
++    msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
++    if (!remove && pointer)
++    {
++        struct pointer_frame *frame = thread->pointer_frames;
++        SIZE_T size = frame ? offsetof(struct pointer_frame, info[frame->count]) : 0;
++        if (!(pending = calloc( 1, sizeof(*pending) ))) return FALSE;
++        if (size && !(pending->frame = malloc( size )))
++        {
++            free( pending );
++            return FALSE;
++        }
++        if (size) memcpy( pending->frame, frame, size );
++        pending->info = pointer->info;
++        pending->hw_id = hw_id;
++        pending->msg = *msg;
++        pending->next = thread->pending_pointer_messages;
++        thread->pending_pointer_messages = pending;
++    }
++    if (remove && msg->message == WM_POINTERLEAVE && pointer)
++    {
++        list_remove( &pointer->entry );
++        free( pointer );
++    }
++    return TRUE;
++}
++
+ /**********************************************************************
+  *       NtUserInitializeTouchInjection    (win32u.@)
+  */
+@@ -3031,3 +3292,154 @@ BOOL WINAPI NtUserInitializeTouchInjection( UINT max_count, UINT mode )
+     FIXME( "max_count %u, mode %#x stub!\n", max_count, mode );
+     return TRUE;
+ }
++
++/**********************************************************************
++ *       NtUserGetPointerType    (win32u.@)
++ */
++BOOL WINAPI NtUserGetPointerType( UINT32 id, POINTER_INPUT_TYPE *type )
++{
++    struct pointer *pointer;
++
++    TRACE( "%u, %p\n", id, type );
++
++    /* pointerid 1 is always the mouse */
++    if (id == 1 && type)
++    {
++        *type = PT_MOUSE;
++        return TRUE;
++    }
++
++    if (!id || !type || !(pointer = find_pointer( id )))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    *type = pointer->type;
++    return TRUE;
++}
++
++/**********************************************************************
++ *       NtUserGetPointerInfoList    (win32u.@)
++ */
++BOOL WINAPI NtUserGetPointerInfoList( UINT32 id, POINTER_INPUT_TYPE type, UINT_PTR flags, UINT_PTR unk1, SIZE_T size,
++                                      UINT32 *entry_count, UINT32 *pointer_count, void *pointer_info )
++{
++    struct user_thread_info *thread = get_user_thread_info();
++    const struct pointer_frame *frame = thread->pointer_frames;
++    struct pointer *pointer = find_pointer( id );
++    UINT entries = 1, pointers = 1, i, entry_capacity;
++    SIZE_T target_size = type == PT_POINTER ? sizeof(POINTER_INFO) :
++                        type == PT_PEN ? sizeof(POINTER_PEN_INFO) : sizeof(POINTER_TOUCH_INFO);
++    BYTE *out = pointer_info;
++    BOOL query;
++
++    if (!entry_count || !pointer_count || size != target_size || flags > 3)
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!pointer)
++    {
++        RtlSetLastWin32Error( ERROR_NO_DATA );
++        return FALSE;
++    }
++    if (type != PT_POINTER && type != pointer->type)
++    {
++        RtlSetLastWin32Error( ERROR_DATATYPE_MISMATCH );
++        return FALSE;
++    }
++    query = !out && ((flags == 1 && !*pointer_count) ||
++                    (flags == 2 && !*entry_count) ||
++                    (flags == 3 && !*entry_count && !*pointer_count));
++    if (!out && !query)
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if ((flags & 1) && pointer->type == PT_TOUCH && frame)
++    {
++        for (i = 0; i < frame->count; i++) if (frame->info[i].pointerId == id) break;
++        if (i == frame->count)
++        {
++            RtlSetLastWin32Error( ERROR_NO_DATA );
++            return FALSE;
++        }
++        pointers = frame->count;
++    }
++    entry_capacity = *entry_count;
++    if (!query && (*pointer_count < pointers || (!(flags & 2) && entry_capacity < entries)))
++    {
++        *entry_count = entries;
++        *pointer_count = pointers;
++        RtlSetLastWin32Error( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    *entry_count = entries;
++    *pointer_count = pointers;
++    TRACE_(touch)( "id %u, type %u, flags %#lx: entries %u, pointers %u, frame %u\n",
++                   id, type, flags, entries, pointers, pointer->info.frameId );
++    if (query || !entry_capacity) return TRUE;
++    for (i = 0; i < pointers; i++, out += size)
++    {
++        const POINTER_INFO *info = &pointer->info;
++        if ((flags & 1) && pointer->type == PT_TOUCH && frame) info = &frame->info[i];
++        memset( out, 0, size );
++        *(POINTER_INFO *)out = *info;
++        ((POINTER_INFO *)out)->historyCount = entries;
++    }
++    return TRUE;
++}
++
++BOOL WINAPI NtUserGetPointerDevices( UINT32 *count, POINTER_DEVICE_INFO *devices )
++{
++    static const WCHAR product[] = {'W','i','n','e',' ','d','i','r','e','c','t',' ',
++                                   't','o','u','c','h','s','c','r','e','e','n',0};
++    UINT contacts = get_system_metrics( SM_MAXIMUMTOUCHES );
++    RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
++    if (!count)
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (devices && contacts && !*count)
++    {
++        *count = 1;
++        RtlSetLastWin32Error( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    *count = !!contacts;
++    if (devices && contacts)
++    {
++        memset( devices, 0, sizeof(*devices) );
++        devices->device = WINE_TOUCH_DEVICE;
++        devices->pointerDeviceType = POINTER_DEVICE_TYPE_TOUCH;
++        devices->monitor = NtUserMonitorFromRect( &rect, MONITOR_DEFAULTTOPRIMARY );
++        devices->startingCursorId = 2;
++        devices->maxActiveContacts = contacts;
++        memcpy( devices->productString, product, sizeof(product) );
++    }
++    return TRUE;
++}
++
++/**********************************************************************
++ *       NtUserGetPointerDeviceRects    (win32u.@)
++ */
++BOOL WINAPI NtUserGetPointerDeviceRects( HANDLE handle, RECT *device_rect, RECT *display_rect )
++{
++    RECT rect;
++
++    if (!device_rect || !display_rect || (handle != INVALID_HANDLE_VALUE && handle != WINE_TOUCH_DEVICE))
++    {
++        RtlSetLastWin32Error( ERROR_NO_DATA );
++        return FALSE;
++    }
++
++    rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
++    SetRect( device_rect, 0, 0, (rect.right - rect.left) * HIMETRIC_PER_INCH / get_system_dpi(),
++             (rect.bottom - rect.top) * HIMETRIC_PER_INCH / get_system_dpi() );
++    *display_rect = rect;
++
++    TRACE( "returning device %s, display %s\n", wine_dbgstr_rect(device_rect), wine_dbgstr_rect(display_rect) );
++    return TRUE;
++}
+diff --git a/dlls/win32u/main.c b/dlls/win32u/main.c
+index fdb1493..a3ee1e3 100644
+--- a/dlls/win32u/main.c
++++ b/dlls/win32u/main.c
+@@ -2555,6 +2555,21 @@ HWND SYSCALL_API NtUserWindowFromPoint( LONG x, LONG y )
+     SYSCALL_FUNC( NtUserWindowFromPoint );
+ }
+ 
++BOOL SYSCALL_API NtUserGetPointerDevices( UINT32 *count, POINTER_DEVICE_INFO *devices )
++{
++    SYSCALL_FUNC( NtUserGetPointerDevices );
++}
++
++BOOL SYSCALL_API NtUserGetPointerType( UINT32 id, POINTER_INPUT_TYPE *type )
++{
++    SYSCALL_FUNC( NtUserGetPointerType );
++}
++
++BOOL SYSCALL_API NtUserGetPointerDeviceRects( HANDLE handle, RECT *device_rect, RECT *display_rect )
++{
++    SYSCALL_FUNC( NtUserGetPointerDeviceRects );
++}
++
+ #define SYSCALL_STUB(name) NTSTATUS SYSCALL_API name(void) { SYSCALL_FUNC( name ); }
+ ALL_SYSCALL_STUBS
+ 
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 138b553..f55151b 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2509,23 +2509,6 @@ static void send_parent_notify( HWND hwnd, WORD event, WORD idChild, POINT pt )
+     }
+ }
+ 
+-/***********************************************************************
+- *          process_pointer_message
+- *
+- * returns TRUE if the contents of 'msg' should be passed to the application
+- */
+-static BOOL process_pointer_message( MSG *msg, UINT hw_id, const struct hardware_msg_data *msg_data )
+-{
+-    RECT rect;
+-
+-    SetRect( &rect, LOWORD(msg->lParam), HIWORD(msg->lParam), LOWORD(msg->lParam), HIWORD(msg->lParam) );
+-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+-    msg->lParam = MAKELPARAM(rect.left, rect.top);
+-
+-    msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
+-    return TRUE;
+-}
+-
+ /***********************************************************************
+  *          process_keyboard_message
+  *
+@@ -2931,7 +2914,7 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
+     else if (is_mouse_message( msg->message ))
+         ret = process_mouse_message( msg, hw_id, msg_data->info, hwnd_filter, first, last, remove );
+     else if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERLEAVE)
+-        ret = process_pointer_message( msg, hw_id, msg_data );
++        ret = process_pointer_message( msg, hw_id, msg_data, remove );
+     else if (msg->message == WM_WINE_CLIPCURSOR)
+         process_wine_clipcursor( msg->hwnd, msg->wParam, msg->lParam );
+     else if (msg->message == WM_WINE_SETCURSOR)
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index e02e484..44f4695 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -138,13 +138,18 @@ struct user_thread_info
+     DWORD                         clipping_reset;         /* time when clipping was last reset */
+     struct session_thread_data   *session_data;           /* shared session thread data */
+     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
++    struct list                   known_pointers;         /* list of known pointers */
++    void                         *pointer_frames;
++    void                         *pending_pointer_messages;
+ };
+ 
+ C_ASSERT( sizeof(struct user_thread_info) <= sizeof(((TEB *)0)->Win32ClientInfo) );
+ 
+ static inline struct user_thread_info *get_user_thread_info(void)
+ {
+-    return CONTAINING_RECORD( NtUserGetThreadInfo(), struct user_thread_info, client_info );
++    struct user_thread_info *info = CONTAINING_RECORD( NtUserGetThreadInfo(), struct user_thread_info, client_info );
++    if (!info->known_pointers.next) list_init( &info->known_pointers );
++    return info;
+ }
+ 
+ struct hook_extra_info
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index c40c036..526bf0d 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -7641,6 +7641,13 @@ int get_system_metrics( int index )
+     case SM_MENUDROPALIGNMENT:
+         NtUserSystemParametersInfo( SPI_GETMENUDROPALIGNMENT, 0, &ret, 0 );
+         return ret;
++    case SM_DIGITIZER:
++        init_display_driver();
++        ret = user_driver->pGetTouchCapabilities ? user_driver->pGetTouchCapabilities() : 0;
++        return ret ? NID_INTEGRATED_TOUCH | NID_READY | (ret > 1 ? NID_MULTI_INPUT : 0) : 0;
++    case SM_MAXIMUMTOUCHES:
++        init_display_driver();
++        return user_driver->pGetTouchCapabilities ? user_driver->pGetTouchCapabilities() : 0;
+     case SM_PENWINDOWS:
+         return 0;
+     case SM_DBCSENABLED:
+@@ -8068,6 +8075,7 @@ static void thread_detach(void)
+     destroy_thread_windows();
+     user_driver->pThreadDetach();
+ 
++    destroy_thread_pointers();
+     free( thread_info->rawinput );
+ 
+     cleanup_imm_thread();
+diff --git a/dlls/win32u/win32u.spec b/dlls/win32u/win32u.spec
+index 638e0ee..220de41 100644
+--- a/dlls/win32u/win32u.spec
++++ b/dlls/win32u/win32u.spec
+@@ -1066,13 +1066,13 @@
+ @ stub -syscall NtUserGetPointerDeviceInputSpace
+ @ stub -syscall NtUserGetPointerDeviceOrientation
+ @ stub -syscall NtUserGetPointerDeviceProperties
+-@ stub -syscall NtUserGetPointerDeviceRects
+-@ stub -syscall NtUserGetPointerDevices
++@ stdcall -syscall NtUserGetPointerDeviceRects(long ptr ptr)
++@ stdcall -syscall NtUserGetPointerDevices(ptr ptr)
+ @ stub -syscall NtUserGetPointerFrameTimes
+ @ stdcall -syscall NtUserGetPointerInfoList(long long long long long ptr ptr ptr)
+ @ stub -syscall NtUserGetPointerInputTransform
+ @ stub -syscall NtUserGetPointerProprietaryId
+-@ stub -syscall NtUserGetPointerType
++@ stdcall -syscall NtUserGetPointerType(long ptr)
+ @ stub -syscall NtUserGetPrecisionTouchPadConfiguration
+ @ stdcall -syscall NtUserGetPriorityClipboardFormat(ptr long)
+ @ stdcall -syscall NtUserGetProcessDefaultLayout(ptr)
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 31a0edb..a7bb393 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -110,6 +110,8 @@ extern USHORT map_scan_to_kbd_vkey( USHORT scan, HKL layout, UINT *mapped );
+ void update_mouse_state_from_pointer( HWND hwnd, UINT msg, unsigned int pointer_id );
+ extern BOOL register_touch_window( HWND hwnd, UINT flags );
+ extern BOOL unregister_touch_window( HWND hwnd );
++extern void destroy_thread_pointers(void);
++extern BOOL process_pointer_message( MSG *msg, UINT hw_id, const struct hardware_msg_data *msg_data, BOOL remove );
+ 
+ /* menu.c */
+ extern UINT draw_nc_menu_bar( HDC hdc, RECT *rect, HWND hwnd );
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index a328361..e8cfe61 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -37,8 +37,7 @@ struct wayland process_wayland =
+     .seat.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .keyboard.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .pointer.mutex = PTHREAD_MUTEX_INITIALIZER,
+-    .touch.touch_points = { &process_wayland.touch.touch_points,
+-                            &process_wayland.touch.touch_points },
++    .touch.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
+@@ -389,6 +388,7 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
+     {
+         TRACE("removing seat\n");
+         if (process_wayland.pointer.wl_pointer) wayland_pointer_deinit();
++        if (process_wayland.touch.wl_touch) wayland_touch_deinit();
+         if (process_wayland.text_input.zwp_text_input_v3) wayland_text_input_deinit();
+         pthread_mutex_lock(&seat->mutex);
+         wl_seat_release(seat->wl_seat);
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 6f2752c..85157c3 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -399,6 +399,8 @@ err:
+  */
+ void wayland_surface_destroy(struct wayland_surface *surface)
+ {
++    wayland_touch_clear_surface(surface->hwnd);
++
+     pthread_mutex_lock(&process_wayland.pointer.mutex);
+     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
+     {
+diff --git a/dlls/winewayland.drv/wayland_touch.c b/dlls/winewayland.drv/wayland_touch.c
+index e9a57f7..ffbe91d 100644
+--- a/dlls/winewayland.drv/wayland_touch.c
++++ b/dlls/winewayland.drv/wayland_touch.c
+@@ -1,7 +1,7 @@
+ /*
+  * Wayland touch handling
+  *
+- * Copyright 2026 Etaash Mathamsetty
++ * Copyright 2026
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -24,222 +24,454 @@
+ 
+ #include "config.h"
+ 
++#include <stdlib.h>
++
+ #include "waylanddrv.h"
+ #include "wine/debug.h"
+ 
+-#include <stdlib.h>
+-
+ WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+ 
+-static LPARAM map_point_vscreen(double x, double y)
+-{
+-    RECT rect = NtUserGetVirtualScreenRect(MDT_RAW_DPI);
+-    int v_x, v_y;
++/* Windows reserves pointer id 1 for the mouse. */
++#define FIRST_TOUCH_POINTER_ID 2
+ 
+-    /* account for vscreen top left not being at 0,0 */
+-    v_x = round((x - rect.left) * (65535.0 / (rect.right - rect.left)));
+-    v_y = round((y - rect.top) * (65535.0 / (rect.bottom - rect.top)));
++struct wayland_touch_contact
++{
++    struct wayland_touch_contact *next;
++    int32_t wayland_id;
++    WORD pointer_id;
++    HWND hwnd;
++    struct wayland_surface *surface;
++    POINT position;
++    BOOL primary;
++};
+ 
+-    /* due to rounding the point may be outside the 0-65535 range */
+-    if (v_x < 0) v_x = 0;
+-    else if (v_x > 65535) v_x = 65535;
+-    if (v_y < 0) v_y = 0;
+-    else if (v_y > 65535) v_y = 65535;
++static struct wayland_touch_contact *find_touch_contact_locked(struct wayland_touch *touch,
++                                                                int32_t wayland_id)
++{
++    struct wayland_touch_contact *contact;
+ 
+-    return MAKELPARAM(v_x, v_y);
++    for (contact = touch->contacts; contact; contact = contact->next)
++        if (contact->wayland_id == wayland_id) return contact;
++    return NULL;
+ }
+ 
+-static void wayland_touch_point_to_window(struct wayland_surface *surface,
+-                                          double surface_x, double surface_y,
+-                                          double *window_x, double *window_y)
++static BOOL touch_pointer_id_in_use_locked(struct wayland_touch *touch, WORD pointer_id)
+ {
+-    *window_x = surface_x * surface->window.scale + surface->window.rect.left;
+-    *window_y = surface_y * surface->window.scale + surface->window.rect.top;
++    struct wayland_touch_contact *contact;
++
++    for (contact = touch->contacts; contact; contact = contact->next)
++        if (contact->pointer_id == pointer_id) return TRUE;
++    return FALSE;
+ }
+ 
+-static void touch_handle_down(void *private, struct wl_touch *wl_touch,
+-		                      uint32_t serial, uint32_t time,
+-					          struct wl_surface *wl_surface, int32_t id,
+-					          wl_fixed_t x, wl_fixed_t y)
++static WORD alloc_touch_pointer_id_locked(struct wayland_touch *touch)
+ {
+-    struct wayland_touch *touch = &process_wayland.touch;
+-    struct wayland_touch_point *point = NULL;
+-    struct wayland_win_data *data = NULL;
+-    struct wayland_surface *surface;
+-    double touch_x, touch_y;
+-    INPUT input = {0};
+-    HWND hwnd;
++    struct wayland_touch_contact *contact;
++    UINT count = 0;
++    WORD candidate, first;
+ 
+-    if (!wl_surface) return;
++    for (contact = touch->contacts; contact; contact = contact->next)
++        if (++count == 256) return 0;
+ 
+-    InterlockedExchange(&process_wayland.input_serial, serial);
++    if (touch->next_pointer_id < FIRST_TOUCH_POINTER_ID)
++        touch->next_pointer_id = FIRST_TOUCH_POINTER_ID;
++    first = touch->next_pointer_id;
+ 
+-    if (!(hwnd = wl_surface_get_user_data(wl_surface))) goto err;
+-    if (!(data = wayland_win_data_get(hwnd))) goto err;
+-    if (!(surface = data->wayland_surface)) goto err;
+-    if (!(point = calloc(1, sizeof(*point)))) goto err;
+-
+-    point->id = id;
+-    point->focused_hwnd = hwnd;
+-    wl_list_init(&point->link);
+-    wayland_touch_point_to_window(surface, wl_fixed_to_double(x),
+-                                  wl_fixed_to_double(y),
+-                                  &touch_x, &touch_y);
+-    point->xy = map_point_vscreen(touch_x, touch_y);
+-    wayland_win_data_release(data);
++    do
++    {
++        candidate = touch->next_pointer_id++;
++        if (touch->next_pointer_id < FIRST_TOUCH_POINTER_ID)
++            touch->next_pointer_id = FIRST_TOUCH_POINTER_ID;
++        if (!touch_pointer_id_in_use_locked(touch, candidate)) return candidate;
++    }
++    while (touch->next_pointer_id != first);
+ 
+-    TRACE("hwnd=%p id=%d pos=(%lf,%lf)\n", hwnd, id, touch_x, touch_y);
++    return 0;
++}
+ 
+-    input.type = INPUT_HARDWARE;
+-    input.hi.uMsg = WM_POINTERDOWN;
+-    input.hi.wParamL = id;
+-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
+-                       POINTER_MESSAGE_FLAG_INCONTACT |
+-                       POINTER_MESSAGE_FLAG_NEW;
++static struct wayland_touch_contact *remove_touch_contact_locked(struct wayland_touch *touch,
++                                                                  int32_t wayland_id)
++{
++    struct wayland_touch_contact **link;
+ 
+-    NtUserSendHardwareInput(hwnd, 0, &input, point->xy);
+-    wl_list_insert(&touch->touch_points, &point->link);
++    for (link = &touch->contacts; *link; link = &(*link)->next)
++    {
++        if ((*link)->wayland_id != wayland_id) continue;
++        {
++            struct wayland_touch_contact *contact = *link;
++            *link = contact->next;
++            contact->next = NULL;
++            return contact;
++        }
++    }
++    return NULL;
++}
+ 
+-    return;
+-err:
+-    if (data) wayland_win_data_release(data);
++static LONG normalize_touch_coordinate(LONG value, LONG origin, LONG extent)
++{
++    long long normalized;
++
++    if (extent <= 0) return 0;
++    normalized = ((long long)value - origin) * 65535 / extent;
++    if (normalized < 0) return 0;
++    if (normalized > 65535) return 65535;
++    return normalized;
+ }
+ 
+-static struct wayland_touch_point *find_touch_point(int32_t id)
++/* Convert surface-local coordinates using the same surface/window mapping as
++ * the Wayland pointer path, then normalize against the complete virtual screen. */
++static BOOL map_touch_point(HWND hwnd, struct wayland_surface *surface,
++                            wl_fixed_t sx, wl_fixed_t sy, POINT *position)
+ {
+-    struct wayland_touch *touch = &process_wayland.touch;
+-    struct wayland_touch_point *point;
++    struct wayland_win_data *data;
++    RECT rect, virtual;
++    POINT point;
+ 
+-    wl_list_for_each(point, &touch->touch_points, link)
+-        if (point->id == id) return point;
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++    if (data->wayland_surface != surface || !(surface = data->wayland_surface))
++    {
++        wayland_win_data_release(data);
++        return FALSE;
++    }
+ 
+-    return NULL;
++    point.x = wl_fixed_to_double(sx);
++    point.y = wl_fixed_to_double(sy);
++    point = map_point_from_surface(surface, point);
++    rect = surface->window.rect;
++    point.x += rect.left;
++    point.y += rect.top;
++
++    /* Keep rounding from producing a point just outside the target window. */
++    if (rect.right <= rect.left || rect.bottom <= rect.top)
++    {
++        wayland_win_data_release(data);
++        return FALSE;
++    }
++    if (point.x >= rect.right) point.x = rect.right - 1;
++    else if (point.x < rect.left) point.x = rect.left;
++    if (point.y >= rect.bottom) point.y = rect.bottom - 1;
++    else if (point.y < rect.top) point.y = rect.top;
++    wayland_win_data_release(data);
++
++    virtual = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
++    position->x = normalize_touch_coordinate( point.x, virtual.left,
++                                               virtual.right - virtual.left );
++    position->y = normalize_touch_coordinate( point.y, virtual.top,
++                                               virtual.bottom - virtual.top );
++    return TRUE;
+ }
+ 
+-static void touch_handle_up(void *private, struct wl_touch *wl_touch,
+-		                    uint32_t serial, uint32_t time, int32_t id)
++static void send_touch_pointer(HWND hwnd, WORD pointer_id, UINT message, UINT flags, POINT position)
+ {
+-    struct wayland_touch_point *point = NULL;
+     INPUT input = {0};
+ 
++    input.type = INPUT_HARDWARE;
++    input.hi.uMsg = message;
++    input.hi.wParamL = pointer_id;
++    input.hi.wParamH = flags;
++    NtUserSendHardwareInput( hwnd, 0, &input, MAKELPARAM( (WORD)position.x, (WORD)position.y ) );
++}
++
++/* The caller holds process_wayland.touch.mutex.  Hardware input submission is
++ * synchronous, so keeping the lock across it preserves contact ordering with
++ * teardown and subsequent pointer-id reuse. */
++static void cancel_touch_contact_locked(struct wayland_touch_contact *contact)
++{
++    send_touch_pointer( contact->hwnd, contact->pointer_id, WM_POINTERUP,
++                        POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_CANCELED |
++                        (contact->primary ? POINTER_MESSAGE_FLAG_PRIMARY : 0),
++                        contact->position );
++    free( contact );
++}
++
++static void cancel_touch_contacts_locked(struct wayland_touch_contact *contacts)
++{
++    struct wayland_touch_contact *contact, *next;
++
++    for (contact = contacts; contact; contact = next)
++    {
++        next = contact->next;
++        cancel_touch_contact_locked( contact );
++    }
++}
++
++static void wayland_touch_handle_down(void *data, struct wl_touch *wl_touch,
++                                      uint32_t serial, uint32_t time,
++                                      struct wl_surface *wl_surface, int32_t wayland_id,
++                                      wl_fixed_t sx, wl_fixed_t sy)
++{
++    struct wayland_touch *touch = &process_wayland.touch;
++    struct wayland_touch_contact *contact;
++    HWND hwnd;
++    struct wayland_win_data *win_data;
++    struct wayland_surface *surface;
++    POINT position;
++    WORD pointer_id;
++    BOOL primary;
++
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    if (!(point = find_touch_point(id)))
++    if (!wl_surface || !(hwnd = wl_surface_get_user_data( wl_surface ))) return;
++    if (!(win_data = wayland_win_data_get( hwnd ))) return;
++    surface = win_data->wayland_surface;
++    wayland_win_data_release( win_data );
++    if (!surface || !map_touch_point( hwnd, surface, sx, sy, &position)) return;
++
++    /* Surface destruction takes win_data_mutex before touch.mutex.  Recheck
++     * the surface in that order and keep the window data locked through the
++     * contact insertion and synchronous DOWN submission. */
++    if (!(win_data = wayland_win_data_get( hwnd )) || win_data->wayland_surface != surface)
++    {
++        if (win_data) wayland_win_data_release( win_data );
++        return;
++    }
++
++    pthread_mutex_lock( &touch->mutex );
++    if (touch->wl_touch != wl_touch || find_touch_contact_locked( touch, wayland_id ) ||
++        !(pointer_id = alloc_touch_pointer_id_locked( touch )))
+     {
+-        ERR("Invalid or stale id=%d\n", id);
++        pthread_mutex_unlock( &touch->mutex );
++        wayland_win_data_release( win_data );
+         return;
+     }
+ 
+-    wl_list_remove(&point->link);
++    if (!(contact = malloc( sizeof(*contact) )))
++    {
++        pthread_mutex_unlock( &touch->mutex );
++        wayland_win_data_release( win_data );
++        return;
++    }
++    primary = !touch->contacts;
++    contact->wayland_id = wayland_id;
++    contact->pointer_id = pointer_id;
++    contact->hwnd = hwnd;
++    contact->surface = surface;
++    contact->position = position;
++    contact->primary = primary;
++    contact->next = touch->contacts;
++    touch->contacts = contact;
++
++    TRACE( "down wayland_id=%d pointer_id=%u hwnd=%p position=%d,%d\n",
++           wayland_id, pointer_id, hwnd, position.x, position.y );
++    send_touch_pointer( hwnd, pointer_id, WM_POINTERDOWN,
++                        POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE |
++                        POINTER_MESSAGE_FLAG_INCONTACT |
++                        (primary ? POINTER_MESSAGE_FLAG_PRIMARY : 0), position );
++    pthread_mutex_unlock( &touch->mutex );
++    wayland_win_data_release( win_data );
++}
+ 
+-    input.type = INPUT_HARDWARE;
+-    input.hi.uMsg = WM_POINTERUP;
+-    input.hi.wParamL = id;
+-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
+-                       POINTER_MESSAGE_FLAG_INCONTACT;
++static void wayland_touch_handle_up(void *data, struct wl_touch *wl_touch,
++                                    uint32_t serial, uint32_t time, int32_t wayland_id)
++{
++    struct wayland_touch *touch = &process_wayland.touch;
++    struct wayland_touch_contact *contact;
+ 
+-    TRACE("hwnd=%p id=%d\n", point->focused_hwnd, id);
++    InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    NtUserSendHardwareInput(point->focused_hwnd, 0, &input, point->xy);
+-    free(point);
++    pthread_mutex_lock( &touch->mutex );
++    if (touch->wl_touch != wl_touch || !(contact = remove_touch_contact_locked( touch, wayland_id )))
++    {
++        pthread_mutex_unlock( &touch->mutex );
++        return;
++    }
++    TRACE( "up wayland_id=%d pointer_id=%u hwnd=%p\n", wayland_id, contact->pointer_id, contact->hwnd );
++    send_touch_pointer( contact->hwnd, contact->pointer_id, WM_POINTERUP,
++                        POINTER_MESSAGE_FLAG_INRANGE |
++                        (contact->primary ? POINTER_MESSAGE_FLAG_PRIMARY : 0), contact->position );
++    free( contact );
++    pthread_mutex_unlock( &touch->mutex );
+ }
+ 
+-static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
+-                                uint32_t time, int32_t id,
+-                                wl_fixed_t x, wl_fixed_t y)
++static void wayland_touch_handle_motion(void *data, struct wl_touch *wl_touch,
++                                        uint32_t time, int32_t wayland_id,
++                                        wl_fixed_t sx, wl_fixed_t sy)
+ {
+-    struct wayland_win_data *data;
++    struct wayland_touch *touch = &process_wayland.touch;
++    struct wayland_touch_contact *contact;
++    HWND hwnd;
+     struct wayland_surface *surface;
+-    struct wayland_touch_point *point;
+-    double touch_x, touch_y;
+-    LPARAM old_xy;
+-    INPUT input = {0};
++    POINT position;
++    WORD pointer_id;
++    BOOL primary;
++    struct wayland_win_data *win_data;
+ 
+-    if (!(point = find_touch_point(id)))
++    pthread_mutex_lock( &touch->mutex );
++    if (touch->wl_touch != wl_touch || !(contact = find_touch_contact_locked( touch, wayland_id )))
+     {
+-        ERR("Invalid or stale id=%d\n", id);
++        pthread_mutex_unlock( &touch->mutex );
+         return;
+     }
++    hwnd = contact->hwnd;
++    surface = contact->surface;
++    pthread_mutex_unlock( &touch->mutex );
+ 
+-    old_xy = point->xy;
+-
+-    if (!(data = wayland_win_data_get(point->focused_hwnd))) return;
+-    if (!(surface = data->wayland_surface))
++    if (!map_touch_point( hwnd, surface, sx, sy, &position))
+     {
+-        wayland_win_data_release(data);
++        pthread_mutex_lock( &touch->mutex );
++        contact = touch->wl_touch == wl_touch ? remove_touch_contact_locked( touch, wayland_id ) : NULL;
++        if (contact) cancel_touch_contact_locked( contact );
++        pthread_mutex_unlock( &touch->mutex );
+         return;
+     }
+-    wayland_touch_point_to_window(surface, wl_fixed_to_double(x),
+-                                  wl_fixed_to_double(y),
+-                                  &touch_x, &touch_y);
+-    point->xy = map_point_vscreen(touch_x, touch_y);
+-    wayland_win_data_release(data);
+ 
+-    if (old_xy != point->xy) return;
+-
+-    TRACE("hwnd=%p pos=(%lf,%lf)\n", point->focused_hwnd, touch_x, touch_y);
++    if (!(win_data = wayland_win_data_get( hwnd )))
++    {
++        pthread_mutex_lock( &touch->mutex );
++        contact = touch->wl_touch == wl_touch ? remove_touch_contact_locked( touch, wayland_id ) : NULL;
++        if (contact) cancel_touch_contact_locked( contact );
++        pthread_mutex_unlock( &touch->mutex );
++        return;
++    }
+ 
+-    input.type = INPUT_HARDWARE;
+-    input.hi.uMsg = WM_POINTERUPDATE;
+-    input.hi.wParamL = id;
+-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
+-                       POINTER_MESSAGE_FLAG_INCONTACT;
++    if (win_data->wayland_surface != surface)
++    {
++        pthread_mutex_lock( &touch->mutex );
++        contact = touch->wl_touch == wl_touch ? remove_touch_contact_locked( touch, wayland_id ) : NULL;
++        if (contact) cancel_touch_contact_locked( contact );
++        pthread_mutex_unlock( &touch->mutex );
++        wayland_win_data_release( win_data );
++        return;
++    }
+ 
+-    NtUserSendHardwareInput(point->focused_hwnd, 0, &input, point->xy);
++    pthread_mutex_lock( &touch->mutex );
++    if (touch->wl_touch != wl_touch || !(contact = find_touch_contact_locked( touch, wayland_id )))
++    {
++        pthread_mutex_unlock( &touch->mutex );
++        wayland_win_data_release( win_data );
++        return;
++    }
++    contact->position = position;
++    pointer_id = contact->pointer_id;
++    primary = contact->primary;
++    hwnd = contact->hwnd;
++
++    send_touch_pointer( hwnd, pointer_id, WM_POINTERUPDATE,
++                        POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT |
++                        (primary ? POINTER_MESSAGE_FLAG_PRIMARY : 0), position );
++    pthread_mutex_unlock( &touch->mutex );
++    wayland_win_data_release( win_data );
+ }
+ 
+-static void touch_handle_frame(void *private, struct wl_touch *wl_touch) { }
++static void wayland_touch_handle_frame(void *data, struct wl_touch *wl_touch)
++{
++}
+ 
+-static void touch_handle_cancel(void *private, struct wl_touch *wl_touch)
++static void wayland_touch_handle_cancel(void *data, struct wl_touch *wl_touch)
+ {
+     struct wayland_touch *touch = &process_wayland.touch;
+-    struct wayland_touch_point *point, *next;
+-    INPUT input = {0};
++    struct wayland_touch_contact *contacts;
+ 
+-    TRACE("\n");
++    pthread_mutex_lock( &touch->mutex );
++    if (touch->wl_touch != wl_touch)
++    {
++        pthread_mutex_unlock( &touch->mutex );
++        return;
++    }
++    contacts = touch->contacts;
++    touch->contacts = NULL;
+ 
+-    input.type = INPUT_HARDWARE;
+-    input.hi.uMsg = WM_POINTERUP;
+-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
+-                       POINTER_MESSAGE_FLAG_INCONTACT;
++    TRACE( "cancel\n" );
++    cancel_touch_contacts_locked( contacts );
++    pthread_mutex_unlock( &touch->mutex );
++}
+ 
+-    wl_list_for_each_safe(point, next, &touch->touch_points, link)
+-    {
+-        input.hi.wParamL = point->id;
++#ifdef WL_TOUCH_SHAPE_SINCE_VERSION
++static void wayland_touch_handle_shape(void *data, struct wl_touch *wl_touch,
++                                       int32_t id, wl_fixed_t major, wl_fixed_t minor)
++{
++}
++#endif
+ 
+-        NtUserSendHardwareInput(point->focused_hwnd, 0, &input, point->xy);
+-        wl_list_remove(&point->link);
+-        free(point);
+-    }
++#ifdef WL_TOUCH_ORIENTATION_SINCE_VERSION
++static void wayland_touch_handle_orientation(void *data, struct wl_touch *wl_touch,
++                                             int32_t id, wl_fixed_t orientation)
++{
+ }
++#endif
+ 
+-static const struct wl_touch_listener wl_touch_listener = {
+-    touch_handle_down,
+-    touch_handle_up,
+-    touch_handle_motion,
+-    touch_handle_frame,
+-    touch_handle_cancel,
++static const struct wl_touch_listener touch_listener =
++{
++    wayland_touch_handle_down,
++    wayland_touch_handle_up,
++    wayland_touch_handle_motion,
++    wayland_touch_handle_frame,
++    wayland_touch_handle_cancel,
++#ifdef WL_TOUCH_SHAPE_SINCE_VERSION
++    wayland_touch_handle_shape,
++#endif
++#ifdef WL_TOUCH_ORIENTATION_SINCE_VERSION
++    wayland_touch_handle_orientation
++#endif
+ };
+ 
+ void wayland_touch_init(struct wl_touch *wl_touch)
+ {
+     struct wayland_touch *touch = &process_wayland.touch;
+ 
++    pthread_mutex_lock( &touch->mutex );
+     touch->wl_touch = wl_touch;
+-    wl_list_init(&touch->touch_points);
+-    wl_touch_add_listener(touch->wl_touch, &wl_touch_listener, NULL);
++    touch->next_pointer_id = FIRST_TOUCH_POINTER_ID;
++    wl_touch_add_listener( wl_touch, &touch_listener, NULL );
++    pthread_mutex_unlock( &touch->mutex );
+ }
+ 
+ void wayland_touch_deinit(void)
+ {
+-    struct wayland_touch_point *point, *next;
+     struct wayland_touch *touch = &process_wayland.touch;
++    struct wl_touch *wl_touch;
++    struct wayland_touch_contact *contacts;
+ 
+-    wl_touch_release(touch->wl_touch);
++    pthread_mutex_lock( &touch->mutex );
++    wl_touch = touch->wl_touch;
++    contacts = touch->contacts;
+     touch->wl_touch = NULL;
+-    wl_list_for_each_safe(point, next, &touch->touch_points, link)
++    touch->contacts = NULL;
++    cancel_touch_contacts_locked( contacts );
++    pthread_mutex_unlock( &touch->mutex );
++    if (wl_touch)
+     {
+-        wl_list_remove(&point->link);
+-        free(point);
++#ifdef WL_TOUCH_RELEASE_SINCE_VERSION
++        if (wl_touch_get_version( wl_touch ) >= WL_TOUCH_RELEASE_SINCE_VERSION)
++            wl_touch_release( wl_touch );
++        else
++#endif
++            wl_touch_destroy( wl_touch );
+     }
+ }
++
++void wayland_touch_clear_surface(HWND hwnd)
++{
++    struct wayland_touch *touch = &process_wayland.touch;
++    struct wayland_touch_contact *contact, *cancelled = NULL;
++    struct wayland_touch_contact **link;
++
++    pthread_mutex_lock( &touch->mutex );
++    for (link = &touch->contacts; *link; )
++    {
++        if ((*link)->hwnd != hwnd)
++        {
++            link = &(*link)->next;
++            continue;
++        }
++        contact = *link;
++        *link = contact->next;
++        contact->next = cancelled;
++        cancelled = contact;
++    }
++    cancel_touch_contacts_locked( cancelled );
++    pthread_mutex_unlock( &touch->mutex );
++}
++
++UINT WAYLAND_GetTouchCapabilities(void)
++{
++    struct wayland_touch *touch = &process_wayland.touch;
++    UINT capabilities;
++
++    pthread_mutex_lock( &touch->mutex );
++    /* wl_touch does not advertise a hardware contact limit.  Expose the
++     * Windows touch interface capacity while a real seat touch capability is active. */
++    capabilities = touch->wl_touch ? 256 : 0;
++    pthread_mutex_unlock( &touch->mutex );
++    return capabilities;
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index c2f1fd4..0bdf8d2 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -167,18 +167,14 @@ struct wayland_pointer
+     pthread_mutex_t mutex;
+ };
+ 
+-struct wayland_touch_point
+-{
+-    struct wl_list link;
+-    LPARAM xy;
+-    HWND focused_hwnd;
+-    int32_t id;
+-};
++struct wayland_touch_contact;
+ 
+ struct wayland_touch
+ {
+     struct wl_touch *wl_touch;
+-    struct wl_list touch_points;
++    struct wayland_touch_contact *contacts;
++    WORD next_pointer_id;
++    pthread_mutex_t mutex;
+ };
+ 
+ struct wayland_text_input
+@@ -565,6 +561,8 @@ void wayland_pointer_clear_constraint(void);
+  */
+ void wayland_touch_init(struct wl_touch *wl_touch);
+ void wayland_touch_deinit(void);
++void wayland_touch_clear_surface(HWND hwnd);
++UINT WAYLAND_GetTouchCapabilities(void);
+ 
+ /**********************************************************************
+  *          Wayland text input
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 6c559d1..50f306b 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -65,6 +65,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
+     .pHasWindowManager = WAYLAND_HasWindowManager,
++    .pGetTouchCapabilities = WAYLAND_GetTouchCapabilities,
+     .pVulkanInit = WAYLAND_VulkanInit,
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+ };
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index eeac1c7..6e22304 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -829,6 +829,7 @@ static const struct user_driver_funcs x11drv_funcs =
+     .pMoveWindowBits = X11DRV_MoveWindowBits,
+     .pWindowPosChanged = X11DRV_WindowPosChanged,
+     .pSystemParametersInfo = X11DRV_SystemParametersInfo,
++    .pGetTouchCapabilities = X11DRV_GetTouchCapabilities,
+     .pWintabProc = X11DRV_WintabProc,
+     .pVulkanInit = X11DRV_VulkanInit,
+     .pOpenGLInit = X11DRV_OpenGLInit,
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index e1a5e70..97afc71 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -371,7 +371,6 @@ void x11drv_xinput2_enable( Display *display, Window window )
+             XISetMask( mask_bits, XI_RawTouchEnd );
+         }
+     }
+-
+     pXISelectEvents( display, window, &mask, 1 );
+ }
+ 
+@@ -438,6 +437,10 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
+ 
+ #else /* HAVE_X11_EXTENSIONS_XINPUT2_H */
+ 
++void x11drv_touch_ids_clear_display( Display *display )
++{
++}
++
+ void x11drv_xinput2_enable( Display *display, Window window )
+ {
+ }
+@@ -1902,41 +1905,119 @@ static BOOL X11DRV_RawButtonEvent( XGenericEventCookie *cookie )
+     return TRUE;
+ }
+ 
+-static BOOL X11DRV_RawTouchEvent( HWND hwnd, XGenericEventCookie *xev )
++/* XInput touch sequences have 32-bit IDs; Windows reserves pointer ID 1 for the mouse. */
++struct touch_id
++{
++    struct touch_id *next;
++    Display *display;
++    unsigned int sequence;
++    int source;
++    WORD id;
++};
++static struct touch_id *touch_ids;
++static pthread_mutex_t touch_ids_mutex = PTHREAD_MUTEX_INITIALIZER;
++static WORD next_touch_id = 2;
++
++static WORD map_touch_id( Display *display, int source, unsigned int sequence, int event )
++{
++    struct touch_id **link, *touch;
++    WORD id = 0;
++    unsigned int tries;
++
++    pthread_mutex_lock( &touch_ids_mutex );
++    for (link = &touch_ids; *link; link = &(*link)->next)
++        if ((*link)->display == display && (*link)->source == source
++                && (*link)->sequence == sequence) break;
++    touch = *link;
++    if (!touch && event == XI_RawTouchBegin)
++    {
++        for (tries = 0; tries < 65534; tries++)
++        {
++            struct touch_id *used;
++            id = next_touch_id++;
++            if (next_touch_id < 2) next_touch_id = 2;
++            for (used = touch_ids; used && used->id != id; used = used->next) {}
++            if (!used) break;
++        }
++        if (tries < 65534 && (touch = malloc( sizeof(*touch) )))
++        {
++            touch->display = display;
++            touch->sequence = sequence;
++            touch->source = source;
++            touch->id = id;
++            touch->next = NULL;
++            *link = touch;
++        }
++    }
++    id = touch ? touch->id : 0;
++    if (touch && event == XI_RawTouchEnd)
++    {
++        *link = touch->next;
++        free( touch );
++    }
++    pthread_mutex_unlock( &touch_ids_mutex );
++    return id;
++}
++
++void x11drv_touch_ids_clear_display( Display *display )
++{
++    struct touch_id **link, *touch;
++
++    pthread_mutex_lock( &touch_ids_mutex );
++    for (link = &touch_ids; *link; )
++    {
++        if ((*link)->display != display)
++        {
++            link = &(*link)->next;
++            continue;
++        }
++        touch = *link;
++        *link = touch->next;
++        free( touch );
++    }
++    pthread_mutex_unlock( &touch_ids_mutex );
++}
++
++static BOOL X11DRV_RawTouchEvent( XGenericEventCookie *xev )
+ {
+     struct x11drv_thread_data *thread_data = x11drv_thread_data();
+     INPUT input = {.type = INPUT_HARDWARE};
+     XIRawEvent *event = xev->data;
+     int flags = 0;
++    WORD id;
+     POINT pos;
+ 
++    /* Use only the desktop's raw stream: XWayland may deliver no XI_Touch*
++     * events to the application, and combining both streams duplicates contacts. */
+     if (!thread_data->xinput2_rawinput) return FALSE;
+-
+     if (!map_raw_event_coords( event, &input, FALSE )) return FALSE;
+     if (!(input.mi.dwFlags & MOUSEEVENTF_ABSOLUTE)) return FALSE;
+     pos.x = input.mi.dx;
+     pos.y = input.mi.dy;
++    id = map_touch_id( xev->display, event->sourceid, event->detail, event->evtype );
++    if (!id) return FALSE;
+ 
+     switch (event->evtype)
+     {
+     case XI_RawTouchBegin:
+         input.hi.uMsg = WM_POINTERDOWN;
+         flags |= POINTER_MESSAGE_FLAG_NEW;
+-        TRACE("XI_TouchBegin detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
++        TRACE("XI_RawTouchBegin detail %u id %u pos %dx%d, flags %#x\n", event->detail, id, pos.x, pos.y, flags);
+         break;
+     case XI_RawTouchEnd:
+         input.hi.uMsg = WM_POINTERUP;
+-        TRACE("XI_TouchEnd detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
++        TRACE("XI_RawTouchEnd detail %u id %u pos %dx%d, flags %#x\n", event->detail, id, pos.x, pos.y, flags);
+         break;
+     case XI_RawTouchUpdate:
+         input.hi.uMsg = WM_POINTERUPDATE;
+-        TRACE("XI_TouchUpdate detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
++        TRACE("XI_RawTouchUpdate detail %u id %u pos %dx%d, flags %#x\n", event->detail, id, pos.x, pos.y, flags);
+         break;
+     }
+ 
+-    input.hi.wParamL = event->detail;
+-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT | flags;
+-    NtUserSendHardwareInput( hwnd, 0, &input, MAKELPARAM( pos.x, pos.y ) );
++    input.hi.wParamL = id;
++    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE | flags;
++    if (event->evtype != XI_RawTouchEnd) input.hi.wParamH |= POINTER_MESSAGE_FLAG_INCONTACT;
++    NtUserSendHardwareInput( 0, 0, &input, MAKELPARAM( pos.x, pos.y ) );
+ 
+     return TRUE;
+ }
+@@ -2018,11 +2099,10 @@ BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *xev )
+     case XI_RawButtonRelease:
+         ret = X11DRV_RawButtonEvent( event );
+         break;
+-
+     case XI_RawTouchBegin:
+     case XI_RawTouchUpdate:
+     case XI_RawTouchEnd:
+-        ret = X11DRV_RawTouchEvent( hwnd, event );
++        ret = X11DRV_RawTouchEvent( event );
+         break;
+ 
+     default:
+@@ -2032,3 +2112,28 @@ BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *xev )
+ #endif
+     return ret;
+ }
++
++/* Only direct slave devices are counted: master devices describe the same contacts. */
++UINT X11DRV_GetTouchCapabilities(void)
++{
++    UINT contacts = 0;
++#if defined(SONAME_LIBXI) && defined(HAVE_X11_EXTENSIONS_XINPUT2_H)
++    XIDeviceInfo *devices;
++    int count, i, j;
++
++    if (!xinput2_available) return 0;
++    if (!(devices = pXIQueryDevice( thread_init_display(), XIAllDevices, &count ))) return 0;
++    for (i = 0; i < count; i++)
++    {
++        if (!devices[i].enabled || devices[i].use != XISlavePointer) continue;
++        for (j = 0; j < devices[i].num_classes; j++)
++        {
++            XITouchClassInfo *touch = (XITouchClassInfo *)devices[i].classes[j];
++            if (touch->type == XITouchClass && touch->mode == XIDirectTouch)
++                contacts += touch->num_touches ? touch->num_touches : 256;
++        }
++    }
++    pXIFreeDeviceInfo( devices );
++#endif
++    return min( contacts, 256 );
++}
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 1e3f213..3bf4d45 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -434,6 +434,7 @@ struct x11drv_thread_data
+ };
+ 
+ extern struct x11drv_thread_data *x11drv_init_thread_data(void);
++extern UINT X11DRV_GetTouchCapabilities(void);
+ 
+ static inline struct x11drv_thread_data *x11drv_thread_data(void)
+ {
+@@ -625,6 +626,7 @@ extern void x11drv_xinput2_load(void);
+ extern void x11drv_xinput2_init( struct x11drv_thread_data *data );
+ extern void x11drv_xinput2_enable( Display *display, Window window );
+ extern void x11drv_xinput2_disable( Display *display, Window window );
++extern void x11drv_touch_ids_clear_display( Display *display );
+ 
+ extern Bool (*pXGetEventData)( Display *display, XEvent /*XGenericEventCookie*/ *event );
+ extern void (*pXFreeEventData)( Display *display, XEvent /*XGenericEventCookie*/ *event );
+diff --git a/dlls/winex11.drv/x11drv_main.c b/dlls/winex11.drv/x11drv_main.c
+index 0ddf6cf..5d44057 100644
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -822,6 +822,7 @@ void X11DRV_ThreadDetach(void)
+         if (data->net_supported) XFree( data->net_supported );
+         if (data->window_manager) XFree( data->window_manager );
+         XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before closing the thread display */
++        x11drv_touch_ids_clear_display( data->display );
+         XCloseDisplay( data->display );
+         free( data );
+         /* clear data in case we get re-entered from user32 before the thread is truly dead */
+diff --git a/dlls/wow64win/user.c b/dlls/wow64win/user.c
+index 5888dc2..31b671e 100644
+--- a/dlls/wow64win/user.c
++++ b/dlls/wow64win/user.c
+@@ -121,6 +121,32 @@ typedef struct
+     } DUMMYUNIONNAME;
+ } INPUT32;
+ 
++static void input_32to64( INPUT *out, const INPUT32 *in )
++{
++    out->type = in->type;
++    switch (out->type)
++    {
++    case INPUT_MOUSE:
++        out->mi.dx          = in->mi.dx;
++        out->mi.dy          = in->mi.dy;
++        out->mi.mouseData   = in->mi.mouseData;
++        out->mi.dwFlags     = in->mi.dwFlags;
++        out->mi.time        = in->mi.time;
++        out->mi.dwExtraInfo = in->mi.dwExtraInfo;
++        break;
++    case INPUT_KEYBOARD:
++        out->ki.wVk         = in->ki.wVk;
++        out->ki.wScan       = in->ki.wScan;
++        out->ki.dwFlags     = in->ki.dwFlags;
++        out->ki.time        = in->ki.time;
++        out->ki.dwExtraInfo = in->ki.dwExtraInfo;
++        break;
++    case INPUT_HARDWARE:
++        out->hi = in->hi;
++        break;
++    }
++}
++
+ typedef struct
+ {
+     int x;
+@@ -339,6 +365,48 @@ typedef struct
+     ULONG  hIconSm;
+ } WNDCLASSEXW32;
+ 
++typedef struct
++{
++    DWORD pointerType;
++    UINT32 pointerId;
++    UINT32 frameId;
++    UINT32 pointerFlags;
++    ULONG sourceDevice;
++    ULONG hwndTarget;
++    POINT ptPixelLocation;
++    POINT ptHimetricLocation;
++    POINT ptPixelLocationRaw;
++    POINT ptHimetricLocationRaw;
++    DWORD dwTime;
++    UINT32 historyCount;
++    INT32 InputData;
++    DWORD dwKeyStates;
++    UINT64 PerformanceCount;
++    INT32 ButtonChangeType;
++} POINTER_INFO32;
++
++typedef struct
++{
++    POINTER_INFO32 pointerInfo;
++    PEN_FLAGS penFlags;
++    PEN_MASK penMask;
++    UINT32 pressure;
++    UINT32 rotation;
++    INT32 tiltX;
++    INT32 tiltY;
++} POINTER_PEN_INFO32;
++
++typedef struct
++{
++    POINTER_INFO32 pointerInfo;
++    TOUCH_FLAGS touchFlags;
++    TOUCH_MASK touchMask;
++    RECT rcContact;
++    RECT rcContactRaw;
++    UINT32 orientation;
++    UINT32 pressure;
++} POINTER_TOUCH_INFO32;
++
+ struct client_menu_name32
+ {
+     ULONG nameA;
+@@ -1736,9 +1804,11 @@ NTSTATUS WINAPI wow64_NtUserCallHwndParam( UINT *args )
+                 ULONG lparam;
+             } *params32 = UlongToPtr( param );
+             struct send_hardware_input_params params;
++            INPUT input;
+ 
+             params.flags = params32->flags;
+-            params.input = UlongToPtr( params32->input );
++            input_32to64( &input, UlongToPtr( params32->input ) );
++            params.input = &input;
+             params.lparam = params32->lparam;
+             return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, code );
+         }
+@@ -2840,18 +2910,134 @@ NTSTATUS WINAPI wow64_NtUserGetOpenClipboardWindow( UINT *args )
+     return HandleToUlong( NtUserGetOpenClipboardWindow() );
+ }
+ 
++static void pointer_info_64to32( POINTER_INFO32 *out, const POINTER_INFO *in )
++{
++    out->pointerType = in->pointerType;
++    out->pointerId = in->pointerId;
++    out->frameId = in->frameId;
++    out->pointerFlags = in->pointerFlags;
++    out->sourceDevice = HandleToUlong( in->sourceDevice );
++    out->hwndTarget = HandleToUlong( in->hwndTarget );
++    out->ptPixelLocation = in->ptPixelLocation;
++    out->ptHimetricLocation = in->ptHimetricLocation;
++    out->ptPixelLocationRaw = in->ptPixelLocationRaw;
++    out->ptHimetricLocationRaw = in->ptHimetricLocationRaw;
++    out->dwTime = in->dwTime;
++    out->historyCount = in->historyCount;
++    out->InputData = in->InputData;
++    out->dwKeyStates = in->dwKeyStates;
++    out->PerformanceCount = in->PerformanceCount;
++    out->ButtonChangeType = in->ButtonChangeType;
++}
++
++static void pointer_pen_info_64to32( POINTER_PEN_INFO32 *out, const POINTER_PEN_INFO *in )
++{
++    pointer_info_64to32( &out->pointerInfo, &in->pointerInfo );
++    out->penFlags = in->penFlags;
++    out->penMask = in->penMask;
++    out->pressure = in->pressure;
++    out->rotation = in->rotation;
++    out->tiltX = in->tiltX;
++    out->tiltY = in->tiltY;
++}
++
++static void pointer_touch_info_64to32( POINTER_TOUCH_INFO32 *out, const POINTER_TOUCH_INFO *in )
++{
++    pointer_info_64to32( &out->pointerInfo, &in->pointerInfo );
++    out->touchFlags = in->touchFlags;
++    out->touchMask = in->touchMask;
++    out->rcContact = in->rcContact;
++    out->rcContactRaw = in->rcContactRaw;
++    out->orientation = in->orientation;
++    out->pressure = in->pressure;
++}
++
++static void pointer_info_list_64to32( UINT size, UINT count, void *out, const void *in )
++{
++    UINT i;
++
++    for (i = 0; i < count; i++)
++    {
++        switch (size)
++        {
++        case sizeof(POINTER_INFO32): pointer_info_64to32( (POINTER_INFO32 *)out + i, (POINTER_INFO *)in + i ); break;
++        case sizeof(POINTER_PEN_INFO32): pointer_pen_info_64to32( (POINTER_PEN_INFO32 *)out + i, (POINTER_PEN_INFO *)in + i ); break;
++        case sizeof(POINTER_TOUCH_INFO32): pointer_touch_info_64to32( (POINTER_TOUCH_INFO32 *)out + i, (POINTER_TOUCH_INFO *)in + i ); break;
++        }
++    }
++}
++
+ NTSTATUS WINAPI wow64_NtUserGetPointerInfoList( UINT *args )
+ {
++    NTSTATUS ret;
+     UINT id = get_ulong( &args );
+     UINT type = get_ulong( &args );
+     UINT unk0 = get_ulong( &args );
+     UINT unk1 = get_ulong( &args );
+     UINT size = get_ulong( &args );
+-    void *entry_count = get_ptr( &args );
+-    void *pointer_count = get_ptr( &args );
+-    void *pointer_info = get_ptr( &args );
++    UINT32 *entry_count = get_ptr( &args );
++    UINT32 *pointer_count = get_ptr( &args );
++    void *pointer_info = get_ptr( &args ), *pointer_info64 = NULL;
++    size_t target_size = 0;
++    UINT entry_capacity, pointer_capacity;
++
++    /* same checks in NtUserGetPointerInfoList */
++    switch (type)
++    {
++    case PT_MOUSE:
++    case PT_PEN: target_size = sizeof(POINTER_PEN_INFO32); break;
++    case PT_POINTER: target_size = sizeof(POINTER_INFO32); break;
++    case PT_TOUCHPAD:
++    case PT_TOUCH: target_size = sizeof(POINTER_TOUCH_INFO32); break;
++    }
++
++    if (!entry_count || !pointer_count || type == PT_MOUSE || size != target_size)
++    {
++        set_last_error32( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
+ 
+-    return NtUserGetPointerInfoList( id, type, unk0, unk1, size, entry_count, pointer_count, pointer_info );
++    switch (size)
++    {
++    case sizeof(POINTER_INFO32): target_size = sizeof(POINTER_INFO); break;
++    case sizeof(POINTER_PEN_INFO32): target_size = sizeof(POINTER_PEN_INFO); break;
++    case sizeof(POINTER_TOUCH_INFO32): target_size = sizeof(POINTER_TOUCH_INFO); break;
++    }
++
++    if (pointer_info && (*entry_count > 0x10000 || *pointer_count > 0x10000 ||
++        (ULONGLONG)*entry_count * *pointer_count > 0x10000))
++    {
++        set_last_error32( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    entry_capacity = *entry_count;
++    pointer_capacity = *pointer_count;
++    if (pointer_info && !(pointer_info64 = Wow64AllocateTemp( max( target_size * entry_capacity * pointer_capacity, 1 ) )))
++    {
++        set_last_error32( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++
++    ret = NtUserGetPointerInfoList( id, type, unk0, unk1, target_size, entry_count, pointer_count, pointer_info64 );
++    if (ret && pointer_info64) pointer_info_list_64to32( size, min(*entry_count, entry_capacity) * min(*pointer_count, pointer_capacity), pointer_info, pointer_info64 );
++    return ret;
++}
++
++NTSTATUS WINAPI wow64_NtUserGetPointerType( UINT *args )
++{
++    UINT id = get_ulong( &args );
++    POINTER_INPUT_TYPE *type = get_ptr( &args );
++
++    return NtUserGetPointerType( id, type );
++}
++
++NTSTATUS WINAPI wow64_NtUserGetPointerDeviceRects( UINT *args )
++{
++    HANDLE device = get_handle( &args );
++    RECT *device_rect = get_ptr( &args );
++    RECT *display_rect = get_ptr( &args );
++
++    return NtUserGetPointerDeviceRects( device, device_rect, display_rect );
+ }
+ 
+ NTSTATUS WINAPI wow64_NtUserGetPriorityClipboardFormat( UINT *args )
+@@ -4217,31 +4403,7 @@ NTSTATUS WINAPI wow64_NtUserSendInput( UINT *args )
+     if (count && !(inputs = Wow64AllocateTemp( count * sizeof(*inputs) )))
+         return 0;
+ 
+-    for (i = 0; i < count; i++)
+-    {
+-        inputs[i].type = inputs32[i].type;
+-        switch (inputs[i].type)
+-        {
+-        case INPUT_MOUSE:
+-            inputs[i].mi.dx          = inputs32[i].mi.dx;
+-            inputs[i].mi.dy          = inputs32[i].mi.dy;
+-            inputs[i].mi.mouseData   = inputs32[i].mi.mouseData;
+-            inputs[i].mi.dwFlags     = inputs32[i].mi.dwFlags;
+-            inputs[i].mi.time        = inputs32[i].mi.time;
+-            inputs[i].mi.dwExtraInfo = inputs32[i].mi.dwExtraInfo;
+-            break;
+-        case INPUT_KEYBOARD:
+-            inputs[i].ki.wVk         = inputs32[i].ki.wVk;
+-            inputs[i].ki.wScan       = inputs32[i].ki.wScan;
+-            inputs[i].ki.dwFlags     = inputs32[i].ki.dwFlags;
+-            inputs[i].ki.time        = inputs32[i].ki.time;
+-            inputs[i].ki.dwExtraInfo = inputs32[i].ki.dwExtraInfo;
+-            break;
+-        case INPUT_HARDWARE:
+-            inputs[i].hi = inputs32[i].hi;
+-            break;
+-        }
+-    }
++    for (i = 0; i < count; i++) input_32to64( &inputs[i], &inputs32[i] );
+ 
+     return NtUserSendInput( count, inputs, sizeof(*inputs) );
+ }
+@@ -5197,3 +5359,39 @@ NTSTATUS WINAPI wow64_NtUserDisplayConfigGetDeviceInfo( UINT *args )
+ 
+     return NtUserDisplayConfigGetDeviceInfo( packet );
+ }
++
++typedef struct
++{
++    DWORD displayOrientation;
++    ULONG device;
++    POINTER_DEVICE_TYPE pointerDeviceType;
++    ULONG monitor;
++    ULONG startingCursorId;
++    USHORT maxActiveContacts;
++    WCHAR productString[POINTER_DEVICE_PRODUCT_STRING_MAX];
++} POINTER_DEVICE_INFO32;
++
++NTSTATUS WINAPI wow64_NtUserGetPointerDevices( UINT *args )
++{
++    UINT32 *count = get_ptr( &args );
++    POINTER_DEVICE_INFO32 *out = get_ptr( &args );
++    POINTER_DEVICE_INFO device;
++    BOOL ret;
++    if (!count)
++    {
++        set_last_error32( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    ret = NtUserGetPointerDevices( count, out ? &device : NULL );
++    if (ret && out && *count)
++    {
++        out->displayOrientation = device.displayOrientation;
++        out->device = HandleToUlong( device.device );
++        out->pointerDeviceType = device.pointerDeviceType;
++        out->monitor = HandleToUlong( device.monitor );
++        out->startingCursorId = device.startingCursorId;
++        out->maxActiveContacts = device.maxActiveContacts;
++        memcpy( out->productString, device.productString, sizeof(out->productString) );
++    }
++    return ret;
++}
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 5f0a0b0..9ae6e78 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -893,6 +893,9 @@ W32KAPI BOOL    WINAPI NtUserGetObjectInformation( HANDLE handle, INT index, voi
+ W32KAPI HWND    WINAPI NtUserGetOpenClipboardWindow(void);
+ W32KAPI BOOL    WINAPI NtUserGetPointerInfoList( UINT32 id, POINTER_INPUT_TYPE type, UINT_PTR, UINT_PTR, SIZE_T size,
+                                                  UINT32 *entry_count, UINT32 *pointer_count, void *pointer_info );
++W32KAPI BOOL    WINAPI NtUserGetPointerType( UINT32 id, POINTER_INPUT_TYPE *type );
++W32KAPI BOOL    WINAPI NtUserGetPointerDeviceRects( HANDLE handle, RECT *device_rect, RECT *display_rect );
++W32KAPI BOOL    WINAPI NtUserGetPointerDevices( UINT32 *count, POINTER_DEVICE_INFO *devices );
+ W32KAPI INT     WINAPI NtUserGetPriorityClipboardFormat( UINT *list, INT count );
+ W32KAPI BOOL    WINAPI NtUserGetProcessDefaultLayout( ULONG *layout );
+ W32KAPI ULONG   WINAPI NtUserGetProcessDpiAwarenessContext( HANDLE process );
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index d6bf258..8860c3d 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -218,7 +218,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 108
++#define WINE_GDI_DRIVER_VERSION 109
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -477,6 +477,8 @@ struct user_driver_funcs
+     UINT    (*pOpenGLInit)(UINT,const struct opengl_funcs *,const struct opengl_driver_funcs **);
+     /* thread management */
+     void    (*pThreadDetach)(void);
++    /* touch support */
++    UINT    (*pGetTouchCapabilities)(void);
+ };
+ 
+ W32KAPI void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version );
+diff --git a/server/queue.c b/server/queue.c
+index 9249236..e66e152 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -824,11 +824,13 @@ static inline int filter_contains_hw_range( unsigned int first, unsigned int las
+      *   WM_NCMOUSEFIRST .. WM_NCMOUSELAST
+      *   WM_INPUT_DEVICE_CHANGE .. WM_KEYLAST
+      *   WM_MOUSEFIRST .. WM_MOUSELAST
++     *   WM_POINTERUPDATE .. WM_POINTERLEAVE
+      */
+     if (last < WM_NCMOUSEFIRST) return 0;
+     if (first > WM_NCMOUSELAST && last < WM_INPUT_DEVICE_CHANGE) return 0;
+     if (first > WM_KEYLAST && last < WM_MOUSEFIRST) return 0;
+-    if (first > WM_MOUSELAST) return 0;
++    if (first > WM_MOUSELAST && last < WM_POINTERUPDATE) return 0;
++    if (first > WM_POINTERLEAVE) return 0;
+     return 1;
+ }
+ 
+@@ -962,6 +964,7 @@ static int merge_unique_message( struct thread_input *input, unsigned int messag
+ static int merge_pointerupdate( struct thread_input *input, const struct message *msg )
+ {
+     struct message *prev;
++    struct hardware_msg_data *prev_data, *msg_data;
+ 
+     LIST_FOR_EACH_ENTRY_REV( prev, &input->msg_list, struct message, entry )
+     {
+@@ -971,11 +974,17 @@ static int merge_pointerupdate( struct thread_input *input, const struct message
+ 
+     if (&prev->entry == &input->msg_list) return 0;
+ 
++    if (prev->unique_id || msg->unique_id) return 0;
+     if (prev->result) return 0;
+     if (prev->win != msg->win) return 0;
+     if (prev->type != msg->type) return 0;
+     if (prev->wparam != msg->wparam) return 0;
+     if (prev->lparam != msg->lparam) return 0;
++    if (!prev->data || !msg->data) return 0;
++    prev_data = prev->data;
++    msg_data = msg->data;
++    if (prev_data->source.device != msg_data->source.device ||
++        prev_data->source.origin != msg_data->source.origin) return 0;
+ 
+     /* now we can merge it */
+     prev->x       = msg->x;
+@@ -2561,8 +2570,9 @@ static struct pointer *find_pointer_from_id( struct desktop *desktop, unsigned i
+ 
+     if (!create) return NULL;
+ 
+-    pointer = mem_alloc( sizeof(struct pointer) );
++    if (!(pointer = mem_alloc( sizeof(struct pointer) ))) return NULL;
+     pointer->timeout = NULL;
++    pointer->win = 0;
+     pointer->desktop = desktop;
+     pointer->primary = list_empty( &desktop->pointers );
+     pointer->x = 0;
+@@ -2684,7 +2694,7 @@ static void queue_pointer_message( struct pointer *pointer, int repeated )
+         {WM_POINTERENTER, WM_POINTERDOWN},
+         {WM_POINTERUP, WM_POINTERLEAVE},
+     };
+-    struct hw_msg_source source = { IMDT_UNAVAILABLE, IMDT_TOUCH };
++    struct hw_msg_source source = { IMDT_TOUCH, IMO_HARDWARE };
+     struct desktop *desktop = pointer->desktop;
+     desktop_shm_t *desktop_shm = desktop->shared;
+     const union hw_input *input = &pointer->input;
+@@ -2692,9 +2702,9 @@ static void queue_pointer_message( struct pointer *pointer, int repeated )
+     struct rectangle top_rect;
+     struct message *msg;
+ 
+-    get_virtual_screen_rect( desktop, &top_rect, 0 );
+-    pointer->x = LOWORD(input->hw.lparam) * (top_rect.right - top_rect.left) / 65535;
+-    pointer->y = HIWORD(input->hw.lparam) * (top_rect.bottom - top_rect.top) / 65535;
++    get_virtual_screen_rect( desktop, &top_rect, 1 );
++    pointer->x = top_rect.left + LOWORD(input->hw.lparam) * (top_rect.right - top_rect.left) / 65535;
++    pointer->y = top_rect.top + HIWORD(input->hw.lparam) * (top_rect.bottom - top_rect.top) / 65535;
+ 
+     if (pointer->primary) wparam |= POINTER_MESSAGE_FLAG_PRIMARY << 16;
+ 
+@@ -2764,10 +2774,19 @@ static void queue_custom_hardware_message( struct desktop *desktop, user_handle_
+ 
+     if (input->hw.msg == WM_POINTERDOWN || input->hw.msg == WM_POINTERUP || input->hw.msg == WM_POINTERUPDATE)
+     {
+-        pointer = find_pointer_from_id( desktop, LOWORD(input->hw.wparam), 1 );
++        if (!(pointer = find_pointer_from_id( desktop, LOWORD(input->hw.wparam),
++                                              input->hw.msg == WM_POINTERDOWN ))) return;
+         if (pointer->timeout) remove_timeout_user( pointer->timeout );
+         pointer->input = *input;
+-        pointer->win = win;
++        if (input->hw.msg == WM_POINTERDOWN)
++        {
++            struct rectangle rect;
++            int x, y;
++            get_virtual_screen_rect( desktop, &rect, 1 );
++            x = rect.left + LOWORD(input->hw.lparam) * (rect.right - rect.left) / 65535;
++            y = rect.top + HIWORD(input->hw.lparam) * (rect.bottom - rect.top) / 65535;
++            pointer->win = win ? win : pointer_window_from_point( desktop, x, y );
++        }
+ 
+         queue_pointer_message( pointer, 0 );
+         return;
+@@ -2962,6 +2981,18 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
+ 
+     if (!queue) return;
+ 
++    /* Cancel captured pointers before their target handle can be reused. */
++    {
++        struct pointer *pointer, *next;
++        LIST_FOR_EACH_ENTRY_SAFE( pointer, next, &queue->input->desktop->pointers, struct pointer, entry )
++        {
++            if (pointer->win != win) continue;
++            if (pointer->timeout) remove_timeout_user( pointer->timeout );
++            list_remove( &pointer->entry );
++            free( pointer );
++        }
++    }
++
+     /* remove timers */
+ 
+     ptr = list_head( &queue->pending_timers );
+diff --git a/server/user.h b/server/user.h
+index 98410d6..4ffbdc9 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -183,6 +183,7 @@ extern int is_window_transparent( user_handle_t window );
+ extern int make_window_active( user_handle_t window );
+ extern struct thread *get_window_thread( user_handle_t handle );
+ extern user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y );
++extern user_handle_t pointer_window_from_point( struct desktop *desktop, int x, int y );
+ extern struct thread *window_thread_from_point( user_handle_t scope, int x, int y );
+ extern user_handle_t find_window_to_repaint( user_handle_t parent, struct thread *thread );
+ extern struct window_class *get_window_class( user_handle_t window );
+diff --git a/server/window.c b/server/window.c
+index 28e7828..c39755c 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -1071,18 +1071,29 @@ user_handle_t shallow_window_from_point( struct desktop *desktop, int x, int y )
+     return desktop->top_window->handle;
+ }
+ 
+-/* return thread of top-most window containing point (in absolute raw coords) */
+-struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
++static struct window *window_from_point( user_handle_t scope, int x, int y )
+ {
+     struct window *win = get_user_object( scope, NTUSER_OBJ_WINDOW );
+ 
+     if (!win) return NULL;
+-
+     map_point_raw_to_virt( win->desktop, &x, &y );
+-
+     screen_to_client( win, &x, &y, 0 );
+-    win = child_window_from_point( win, x, y );
+-    if (!win->thread) return NULL;
++    return child_window_from_point( win, x, y );
++}
++
++/* XInput2 events lack a Win32 target. Hit-test the logical hierarchy, including
++ * layered windows whose native input can pass through their transparent pixels. */
++user_handle_t pointer_window_from_point( struct desktop *desktop, int x, int y )
++{
++    struct window *win = window_from_point( shallow_window_from_point( desktop, x, y ), x, y );
++    return win ? win->handle : 0;
++}
++
++/* return thread of top-most window containing point (in absolute raw coords) */
++struct thread *window_thread_from_point( user_handle_t scope, int x, int y )
++{
++    struct window *win = window_from_point( scope, x, y );
++    if (!win || !win->thread) return NULL;
+     return (struct thread *)grab_object( win->thread );
+ }
+ 
