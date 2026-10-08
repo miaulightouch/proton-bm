@@ -6,9 +6,10 @@ Bemani-focused improvements to [Proton-CachyOS](https://github.com/CachyOS/proto
 > # it's experimental AI slop!
 > author can't even understand the codes.
 
-- **Multitouch:** Windows pointer input on XWayland and Wayland.
-- **Sound System:** PipeWire exclusive audio, experimental DirectSound effects and audio device fixes.
-- **Compatibility Fixes:** Media playback and Shader Model 2 compilation fixes.
+- **Multitouch:** Implements Windows pointer input on XWayland and Wayland.
+- **Native Exclusive Audio Support:** WASAPI exclusive playback through PipeWire.
+- **Native Sound Effects Support:** Optional native DirectSound effects and experimental built-in effects.
+- **Compatibility Fixes:** Media playback, audio device mapping and Shader Model 2 compilation fixes.
 
 See the [wiki](https://github.com/miaulightouch/proton-bm/wiki) for supported behavior and [setup](https://github.com/miaulightouch/proton-bm/wiki/Setup), including [IIDX audio effects](https://github.com/miaulightouch/proton-bm/wiki/Setup#audio-effects).
 
