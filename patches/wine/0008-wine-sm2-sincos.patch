@@ -1,0 +1,116 @@
+diff --git a/dlls/d3dcompiler_43/tests/hlsl_d3d9.c b/dlls/d3dcompiler_43/tests/hlsl_d3d9.c
+index d9d050c3f998..04b6f401879e 100644
+--- a/dlls/d3dcompiler_43/tests/hlsl_d3d9.c
++++ b/dlls/d3dcompiler_43/tests/hlsl_d3d9.c
+@@ -718,6 +718,81 @@
+     release_test_context(&test_context);
+ }
+ 
++static void test_sincos_profiles(void)
++{
++    static const char pixel_source[] =
++        "float4 main(float x : TEXCOORD0) : COLOR\n"
++        "{\n"
++        "    return float4(sin(x), cos(x), 0.0, 1.0);\n"
++        "}\n";
++    static const char vertex_source[] =
++        "float4 main(float4 pos : POSITION) : POSITION\n"
++        "{\n"
++        "    pos.x += sin(pos.x);\n"
++        "    pos.y += cos(pos.y);\n"
++        "    return pos;\n"
++        "}\n";
++    static const struct
++    {
++        const char *target, *source;
++        DWORD version;
++        unsigned int sincos_length;
++    }
++    tests[] =
++    {
++        {"ps_2_0", pixel_source, 0xffff0200, 4},
++        {"ps_2_a", pixel_source, 0xffff0200, 4},
++        {"ps_2_b", pixel_source, 0xffff0200, 4},
++        {"ps_2_sw", pixel_source, 0xffff0200, 4},
++        {"ps_3_0", pixel_source, 0xffff0300, 2},
++        {"vs_2_0", vertex_source, 0xfffe0200, 4},
++        {"vs_2_a", vertex_source, 0xfffe0200, 4},
++        {"vs_2_sw", vertex_source, 0xfffe0200, 4},
++        {"vs_3_0", vertex_source, 0xfffe0300, 2},
++    };
++    ID3D10Blob *shader, *disassembly;
++    unsigned int i, j, length, count, sincos_count;
++    const DWORD *tokens;
++    HRESULT hr;
++
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        winetest_push_context("%s", tests[i].target);
++        if ((shader = compile_shader(tests[i].source, tests[i].target, 0)))
++        {
++            tokens = ID3D10Blob_GetBufferPointer(shader);
++            count = ID3D10Blob_GetBufferSize(shader) / sizeof(*tokens);
++            ok(count && (tokens[0] & 0xffffff00) == tests[i].version,
++                    "Unexpected shader version %#lx.\n", count ? tokens[0] : 0);
++
++            sincos_count = 0;
++            for (j = 1; j < count && tokens[j] != D3DSIO_END; j += length + 1)
++            {
++                if ((tokens[j] & D3DSI_OPCODE_MASK) == D3DSIO_COMMENT)
++                    length = (tokens[j] & D3DSI_COMMENTSIZE_MASK) >> D3DSI_COMMENTSIZE_SHIFT;
++                else
++                    length = (tokens[j] & D3DSI_INSTLENGTH_MASK) >> D3DSI_INSTLENGTH_SHIFT;
++                if ((tokens[j] & D3DSI_OPCODE_MASK) == D3DSIO_SINCOS)
++                {
++                    /* SM2 has three source operands; SM3 has one. */
++                    ok(length == tests[i].sincos_length, "Unexpected SINCOS length %u.\n", length);
++                    ++sincos_count;
++                }
++            }
++            ok(j < count && tokens[j] == D3DSIO_END, "Missing shader end token.\n");
++            ok(sincos_count, "Compiled shader did not contain SINCOS.\n");
++
++            disassembly = NULL;
++            hr = D3DDisassemble(tokens, ID3D10Blob_GetBufferSize(shader), 0, NULL, &disassembly);
++            ok(hr == S_OK, "Failed to disassemble shader, hr %#lx.\n", hr);
++            if (disassembly)
++                ID3D10Blob_Release(disassembly);
++            ID3D10Blob_Release(shader);
++        }
++        winetest_pop_context();
++    }
++}
++
+ static void test_comma(void)
+ {
+     struct test_context test_context;
+@@ -1868,6 +1943,7 @@
+     test_conditionals();
+     test_float_vectors();
+     test_trig();
++    test_sincos_profiles();
+     test_comma();
+     test_return();
+     test_array_dimensions();
+diff --git a/libs/vkd3d/libs/vkd3d-shader/d3dbc.c b/libs/vkd3d/libs/vkd3d-shader/d3dbc.c
+index 87a7d48acca7..c29ca594747a 100644
+--- a/libs/vkd3d/libs/vkd3d-shader/d3dbc.c
++++ b/libs/vkd3d/libs/vkd3d-shader/d3dbc.c
+@@ -293,7 +293,7 @@
+     {VKD3D_SM1_OP_SGN,          1, 3, VSIR_OP_SGN,          {2, 0}, {2, 1}},
+     {VKD3D_SM1_OP_SGN,          1, 1, VSIR_OP_SGN,          {3, 0}},
+     {VKD3D_SM1_OP_NRM,          1, 1, VSIR_OP_NRM,          {2, 0}},
+-    {VKD3D_SM1_OP_SINCOS,       1, 3, VSIR_OP_SINCOS,       {2, 0}, {2, 1}},
++    {VKD3D_SM1_OP_SINCOS,       1, 3, VSIR_OP_SINCOS,       {2, 0}, {2, 255}},
+     {VKD3D_SM1_OP_SINCOS,       1, 1, VSIR_OP_SINCOS,       {3, 0}},
+     /* Matrix */
+     {VKD3D_SM1_OP_M4x4,         1, 2, VSIR_OP_M4x4},
+@@ -354,7 +354,7 @@
+     {VKD3D_SM1_OP_POW,          1, 2, VSIR_OP_POW,          {2, 0}},
+     {VKD3D_SM1_OP_CRS,          1, 2, VSIR_OP_CRS,          {2, 0}},
+     {VKD3D_SM1_OP_NRM,          1, 1, VSIR_OP_NRM,          {2, 0}},
+-    {VKD3D_SM1_OP_SINCOS,       1, 3, VSIR_OP_SINCOS,       {2, 0}, {2, 1}},
++    {VKD3D_SM1_OP_SINCOS,       1, 3, VSIR_OP_SINCOS,       {2, 0}, {2, 255}},
+     {VKD3D_SM1_OP_SINCOS,       1, 1, VSIR_OP_SINCOS,       {3, 0}},
+     {VKD3D_SM1_OP_DP2ADD,       1, 3, VSIR_OP_DP2ADD,       {2, 0}},
+     /* Matrix */
