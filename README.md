@@ -2,6 +2,10 @@
 
 Bemani-focused improvements to [Proton-CachyOS](https://github.com/CachyOS/proton-cachyos).
 
+> [!WARNING]
+> # it's experimental AI slop!
+> author can't even understand the codes.
+
 - **Multitouch:** Windows pointer input on XWayland and Wayland.
 - **Sound System:** PipeWire exclusive audio, experimental DirectSound effects and audio device fixes.
 - **Media Playback:** WMA/WMV playback compatibility and DirectShow video fixes.
