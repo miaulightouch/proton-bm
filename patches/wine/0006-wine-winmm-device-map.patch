@@ -1,0 +1,112 @@
+diff --git a/dlls/winmm/waveform.c b/dlls/winmm/waveform.c
+index fa1c446ff916..002e124b78bd 100644
+--- a/dlls/winmm/waveform.c
++++ b/dlls/winmm/waveform.c
+@@ -560,6 +560,7 @@
+         IMMDeviceEnumerator *devenum)
+ {
+     IMMDeviceCollection *devcoll;
++    UINT device_count;
+     HRESULT hr;
+ 
+     hr = IMMDeviceEnumerator_EnumAudioEndpoints(devenum, flow,
+@@ -567,54 +568,71 @@
+     if(FAILED(hr))
+         return hr;
+ 
+-    hr = IMMDeviceCollection_GetCount(devcoll, devcount);
++    hr = IMMDeviceCollection_GetCount(devcoll, &device_count);
+     if(FAILED(hr)){
+         IMMDeviceCollection_Release(devcoll);
+         return hr;
+     }
+ 
+-    if(*devcount > 0){
+-        UINT n, count = 1;
++    *devcount = 0;
++    if(device_count > 0){
++        UINT n, count = 0;
+         IMMDevice *def_dev = NULL;
+-
+-        *devices = calloc(*devcount, sizeof(WINMM_MMDevice));
++        WCHAR *default_id = NULL;
++
++        *devices = calloc(device_count, sizeof(WINMM_MMDevice));
+         if(!*devices){
+             IMMDeviceCollection_Release(devcoll);
+             return E_OUTOFMEMORY;
+         }
+ 
+-        *map = calloc(*devcount, sizeof(WINMM_MMDevice *));
++        *map = calloc(device_count, sizeof(WINMM_MMDevice *));
+         if(!*map){
+             IMMDeviceCollection_Release(devcoll);
+             free(*devices);
++            *devices = NULL;
+             return E_OUTOFMEMORY;
+         }
+ 
+-        /* make sure that device 0 is the default device */
+-        IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum,
++        /* Interface pointers can differ for the same endpoint, e.g. with proxies. */
++        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum,
+                 flow, eConsole, &def_dev);
+-
+-        for(n = 0; n < *devcount; ++n){
++        if(SUCCEEDED(hr)){
++            IMMDevice_GetId(def_dev, &default_id);
++            IMMDevice_Release(def_dev);
++        }
++
++        for(n = 0; n < device_count; ++n){
+             IMMDevice *device;
++            WINMM_MMDevice *mmdevice = &(*devices)[count];
+ 
+             hr = IMMDeviceCollection_Item(devcoll, n, &device);
+             if(SUCCEEDED(hr)){
+-                WINMM_InitMMDevice(flow, device, &(*devices)[n], n);
+-
+-                if(device == def_dev)
+-                    (*map)[0] = &(*devices)[n];
+-                else{
+-                    (*map)[count] = &(*devices)[n];
++                hr = WINMM_InitMMDevice(flow, device, mmdevice, count);
++                if(SUCCEEDED(hr)){
++                    (*map)[count] = mmdevice;
++                    if(default_id && !wcscmp(mmdevice->dev_id, default_id)){
++                        memmove(*map + 1, *map, count * sizeof(**map));
++                        (*map)[0] = mmdevice;
++                    }
+                     ++count;
++                }else{
++                    CoTaskMemFree(mmdevice->dev_id);
++                    memset(mmdevice, 0, sizeof(*mmdevice));
+                 }
+-
+                 IMMDevice_Release(device);
+             }
+         }
+ 
+-        IMMDevice_Release(def_dev);
++        CoTaskMemFree(default_id);
+ 
+         *devcount = count;
++        if(!count){
++            free(*map);
++            *map = NULL;
++            free(*devices);
++            *devices = NULL;
++        }
+     }
+ 
+     IMMDeviceCollection_Release(devcoll);
+@@ -665,6 +683,9 @@
+ {
+     WINMM_MMDevice *prev;
+     UINT i;
++
++    if(!count || !default_id)
++        return S_FALSE;
+ 
+     prev = (*map)[0];
+     for(i = 0; i < count; ++i){
