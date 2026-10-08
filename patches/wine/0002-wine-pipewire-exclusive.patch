@@ -1,0 +1,1430 @@
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+index 29481de8e751..6922d4c25bbb 100644
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -166,10 +166,6 @@
+             else if (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
+                 if (*duration != *period)
+                     return AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL;
+-
+-                FIXME("EXCLUSIVE mode with EVENTCALLBACK\n");
+-
+-                return AUDCLNT_E_DEVICE_IN_USE;
+             } else if (*duration < 8 * *period)
+                 *duration = 8 * *period; /* May grow above 2s. */
+         }
+diff --git a/dlls/mmdevapi/tests/Makefile.in b/dlls/mmdevapi/tests/Makefile.in
+index dc515833ce19..9132364f070c 100644
+--- a/dlls/mmdevapi/tests/Makefile.in
++++ b/dlls/mmdevapi/tests/Makefile.in
+@@ -4,6 +4,8 @@
+ SOURCES = \
+ 	capture.c \
+ 	dependency.c \
++	exclusive.c \
++	exclusive_shared.c \
+ 	mmdevenum.c \
+ 	propstore.c \
+ 	render.c \
+diff --git a/dlls/mmdevapi/tests/exclusive.c b/dlls/mmdevapi/tests/exclusive.c
+new file mode 100644
+index 000000000000..e1d53fc6b11b
+--- /dev/null
++++ b/dlls/mmdevapi/tests/exclusive.c
+@@ -0,0 +1,192 @@
++/*
++ * Event-driven exclusive render streams.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define COBJMACROS
++#include <io.h>
++#include <math.h>
++#include "windows.h"
++#include "wine/test.h"
++#ifdef STANDALONE
++#include "initguid.h"
++#endif
++#include "mmdeviceapi.h"
++#include "audioclient.h"
++
++static void test_exclusive_event(IMMDevice *device, UINT rate, WORD tag)
++{
++    WAVEFORMATEX format = {tag, 2, rate};
++    IAudioRenderClient *render = NULL;
++    IAudioClock *clock = NULL;
++    IAudioClient *client;
++    REFERENCE_TIME period;
++    UINT32 frames, padding, i, j;
++    UINT64 frequency, position, qpctime;
++    LARGE_INTEGER qpc_before, qpc_after, qpc_frequency = {0};
++    HANDLE event = NULL;
++    BYTE *data;
++    HRESULT hr;
++    double phase = 0.0;
++
++    format.wBitsPerSample = tag == WAVE_FORMAT_PCM ? 16 : 32;
++    format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
++    format.nAvgBytesPerSec = rate * format.nBlockAlign;
++    hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
++    ok(hr == S_OK, "Activate failed: %#lx.\n", hr);
++    if (FAILED(hr)) return;
++
++    hr = IAudioClient_IsFormatSupported(client, AUDCLNT_SHAREMODE_EXCLUSIVE, &format, NULL);
++    ok(hr == S_OK || hr == AUDCLNT_E_UNSUPPORTED_FORMAT || hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED,
++       "IsFormatSupported failed: %#lx.\n", hr);
++    if (hr != S_OK)
++    {
++        skip("Exclusive %u Hz, tag %u is unavailable: %#lx.\n", rate, tag, hr);
++        goto done;
++    }
++    hr = IAudioClient_GetDevicePeriod(client, NULL, &period);
++    ok(hr == S_OK, "GetDevicePeriod failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
++                                period + 1, period, &format, NULL);
++    ok(hr == AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL, "Unequal periods returned %#lx.\n", hr);
++    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
++                                period, period, &format, NULL);
++    ok(hr == S_OK || hr == AUDCLNT_E_DEVICE_IN_USE, "Initialize failed: %#lx.\n", hr);
++    if (hr != S_OK) goto done;
++
++    hr = IAudioClient_GetBufferSize(client, &frames);
++    ok(hr == S_OK && frames > 1, "Invalid buffer: %#lx, %u frames.\n", hr, frames);
++    if (FAILED(hr) || frames < 2) goto done;
++    trace("Exclusive event stream: %u Hz, tag %u, %u frames, period %I64d.\n",
++          rate, tag, frames, period);
++    hr = IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&render);
++    ok(hr == S_OK, "GetService(render) failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetService(client, &IID_IAudioClock, (void **)&clock);
++    ok(hr == S_OK, "GetService(clock) failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClock_GetFrequency(clock, &frequency);
++    ok(hr == S_OK && frequency == rate, "Frequency %#lx, %I64u, expected %u.\n",
++       hr, frequency, rate);
++
++    hr = IAudioRenderClient_GetBuffer(render, frames - 1, &data);
++    ok(hr == AUDCLNT_E_BUFFER_SIZE_ERROR, "Partial GetBuffer returned %#lx.\n", hr);
++    hr = IAudioRenderClient_GetBuffer(render, frames, &data);
++    ok(hr == S_OK, "GetBuffer failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioRenderClient_ReleaseBuffer(render, frames - 1, AUDCLNT_BUFFERFLAGS_SILENT);
++    ok(hr == AUDCLNT_E_BUFFER_SIZE_ERROR, "Partial ReleaseBuffer returned %#lx.\n", hr);
++    hr = IAudioRenderClient_ReleaseBuffer(render, 0, 0);
++    ok(hr == AUDCLNT_E_BUFFER_SIZE_ERROR, "Empty ReleaseBuffer returned %#lx.\n", hr);
++    hr = IAudioRenderClient_ReleaseBuffer(render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
++    ok(hr == S_OK, "ReleaseBuffer failed: %#lx.\n", hr);
++    hr = IAudioClient_Start(client);
++    ok(hr == AUDCLNT_E_EVENTHANDLE_NOT_SET, "Start without an event returned %#lx.\n", hr);
++
++    event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    ok(!!event, "CreateEvent failed.\n");
++    if (!event) goto done;
++    hr = IAudioClient_SetEventHandle(client, event);
++    ok(hr == S_OK, "SetEventHandle failed: %#lx.\n", hr);
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Start failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    for (i = 0; i < 64; ++i)
++    {
++        DWORD wait = WaitForSingleObject(event, 1000);
++        ok(wait == WAIT_OBJECT_0, "Event %u timed out: %lu.\n", i, wait);
++        if (wait != WAIT_OBJECT_0) break;
++        if (i == 8)
++        {
++            Sleep(20);
++            ok(WaitForSingleObject(event, 0) == WAIT_TIMEOUT, "Buffer readiness was signalled twice.\n");
++        }
++        hr = IAudioClient_GetCurrentPadding(client, &padding);
++        ok(hr == S_OK && padding == 0, "Padding at event %u: %#lx, %u.\n", i, hr, padding);
++        hr = IAudioRenderClient_GetBuffer(render, frames, &data);
++        ok(hr == S_OK, "Full-buffer GetBuffer at event %u: %#lx.\n", i, hr);
++        if (FAILED(hr)) break;
++        if (winetest_interactive)
++            for (j = 0; j < frames * format.nChannels; ++j)
++            {
++                double sample = sin(phase) * 0.1;
++                if (tag == WAVE_FORMAT_PCM) ((short *)data)[j] = sample * 32767;
++                else ((float *)data)[j] = sample;
++                if (j % format.nChannels == format.nChannels - 1) phase += 2.0 * 3.141592653589793 * 440.0 / rate;
++            }
++        hr = IAudioRenderClient_ReleaseBuffer(render, frames, winetest_interactive ? 0 : AUDCLNT_BUFFERFLAGS_SILENT);
++        ok(hr == S_OK, "Full-buffer ReleaseBuffer at event %u: %#lx.\n", i, hr);
++    }
++    ok(QueryPerformanceFrequency(&qpc_frequency), "QueryPerformanceFrequency failed.\n");
++    QueryPerformanceCounter(&qpc_before);
++    hr = IAudioClock_GetPosition(clock, &position, &qpctime);
++    QueryPerformanceCounter(&qpc_after);
++    if (hr == S_OK && qpc_frequency.QuadPart > 0)
++        ok(qpctime / 10000000.0 >= qpc_before.QuadPart / (double)qpc_frequency.QuadPart - 0.1
++                && qpctime / 10000000.0 <= qpc_after.QuadPart / (double)qpc_frequency.QuadPart + 0.1,
++                "Clock QPC %I64u is outside the current performance-counter interval.\n", qpctime);
++    ok(hr == S_OK && position >= (UINT64)frames * (i > 1 ? i - 1 : 0) &&
++       position <= (UINT64)frames * (i + 1),
++       "Clock did not advance with buffers: %#lx, %I64u, %u events.\n", hr, position, i);
++    hr = IAudioClient_Stop(client);
++    ok(hr == S_OK, "Stop failed: %#lx.\n", hr);
++    ResetEvent(event);
++    ok(WaitForSingleObject(event, 50) == WAIT_TIMEOUT, "Stopped stream signalled its event.\n");
++    hr = IAudioClient_Reset(client);
++    ok(hr == S_OK, "Reset failed: %#lx.\n", hr);
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK && !padding, "Padding after reset: %#lx, %u.\n", hr, padding);
++    ResetEvent(event);
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Empty-buffer Start failed: %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        ok(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0, "Empty stream did not signal readiness.\n");
++        hr = IAudioRenderClient_GetBuffer(render, frames, &data);
++        ok(hr == S_OK, "Empty-stream GetBuffer failed: %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IAudioRenderClient_ReleaseBuffer(render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
++            ok(hr == S_OK, "Empty-stream ReleaseBuffer failed: %#lx.\n", hr);
++        }
++    }
++done:
++    IAudioClient_Stop(client);
++    if (clock) IAudioClock_Release(clock);
++    if (render) IAudioRenderClient_Release(render);
++    IAudioClient_Release(client);
++    if (event) CloseHandle(event);
++}
++
++START_TEST(exclusive)
++{
++    IMMDeviceEnumerator *enumerator;
++    IMMDevice *device;
++    HRESULT hr;
++
++    CoInitialize(NULL);
++    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
++                         &IID_IMMDeviceEnumerator, (void **)&enumerator);
++    ok(hr == S_OK, "Enumerator creation failed: %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &device);
++        if (SUCCEEDED(hr))
++        {
++            test_exclusive_event(device, 44100, WAVE_FORMAT_PCM);
++            test_exclusive_event(device, 48000, WAVE_FORMAT_PCM);
++            test_exclusive_event(device, 44100, WAVE_FORMAT_IEEE_FLOAT);
++            test_exclusive_event(device, 48000, WAVE_FORMAT_IEEE_FLOAT);
++            IMMDevice_Release(device);
++        }
++        else skip("No render endpoint: %#lx.\n", hr);
++        IMMDeviceEnumerator_Release(enumerator);
++    }
++    CoUninitialize();
++}
+diff --git a/dlls/mmdevapi/tests/exclusive_shared.c b/dlls/mmdevapi/tests/exclusive_shared.c
+new file mode 100644
+index 000000000000..c07b11e1cb56
+--- /dev/null
++++ b/dlls/mmdevapi/tests/exclusive_shared.c
+@@ -0,0 +1,504 @@
++/*
++ * Shared event-driven render streams.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define COBJMACROS
++#include <io.h>
++#include "windows.h"
++#include "wine/test.h"
++#ifdef STANDALONE
++#include "initguid.h"
++#endif
++#include "mmdeviceapi.h"
++#include "audioclient.h"
++#include "ksmedia.h"
++#include "devpkey.h"
++
++static BOOL is_unavailable(HRESULT hr)
++{
++    return hr == AUDCLNT_E_UNSUPPORTED_FORMAT || hr == AUDCLNT_E_DEVICE_IN_USE;
++}
++
++static DWORD channel_mask(UINT channels)
++{
++    switch (channels)
++    {
++    case 2: return KSAUDIO_SPEAKER_STEREO;
++    case 4: return KSAUDIO_SPEAKER_SURROUND;
++    case 6: return KSAUDIO_SPEAKER_5POINT1;
++    case 8: return KSAUDIO_SPEAKER_7POINT1_SURROUND;
++    default: return 0;
++    }
++}
++
++static void make_format(WAVEFORMATEXTENSIBLE *format, UINT rate, UINT channels, BOOL ieee_float)
++{
++    WORD bits = ieee_float ? 32 : 16;
++
++    ZeroMemory(format, sizeof(*format));
++    format->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    format->Format.nChannels = channels;
++    format->Format.nSamplesPerSec = rate;
++    format->Format.wBitsPerSample = bits;
++    format->Format.nBlockAlign = channels * bits / 8;
++    format->Format.nAvgBytesPerSec = rate * format->Format.nBlockAlign;
++    format->Format.cbSize = sizeof(*format) - sizeof(format->Format);
++    format->Samples.wValidBitsPerSample = bits;
++    format->dwChannelMask = channel_mask(channels);
++    format->SubFormat = ieee_float ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
++}
++
++static BOOL wait_event(HANDLE event, UINT number, DWORD timeout)
++{
++    DWORD wait = WaitForSingleObject(event, timeout);
++
++    ok(wait == WAIT_OBJECT_0, "Event %u timed out: %lu.\n", number, wait);
++    return wait == WAIT_OBJECT_0;
++}
++
++static BOOL test_shared_event_format(IMMDevice *device, UINT rate, UINT channels, BOOL ieee_float)
++{
++    WAVEFORMATEXTENSIBLE format;
++    WAVEFORMATEX *closest = NULL;
++    IAudioRenderClient *render = NULL;
++    IAudioClient *client = NULL;
++    REFERENCE_TIME default_period, minimum_period, period;
++    UINT32 frames, padding, available, request;
++    BYTE *data;
++    HANDLE event = NULL;
++    HRESULT hr;
++    UINT i;
++    BOOL started = FALSE;
++    const char *kind = ieee_float ? "float" : "pcm";
++
++    make_format(&format, rate, channels, ieee_float);
++    hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
++    ok(hr == S_OK, "Activate %s %u-channel client failed: %#lx.\n", kind, channels, hr);
++    if (FAILED(hr)) return FALSE;
++
++    hr = IAudioClient_IsFormatSupported(client, AUDCLNT_SHAREMODE_SHARED,
++            &format.Format, &closest);
++    if (hr == S_FALSE)
++    {
++        ok(!!closest, "S_FALSE without a closest format.\n");
++        skip("Shared %s %u-channel format is not the endpoint mix format.\n", kind, channels);
++        CoTaskMemFree(closest);
++        IAudioClient_Release(client);
++        return TRUE;
++    }
++    if (is_unavailable(hr))
++    {
++        skip("Shared %s %u-channel format is unavailable: %#lx.\n", kind, channels, hr);
++        CoTaskMemFree(closest);
++        IAudioClient_Release(client);
++        return TRUE;
++    }
++    ok(hr == S_OK && !closest, "IsFormatSupported(%s,%u) returned %#lx, suggestion %p.\n",
++       kind, channels, hr, closest);
++    CoTaskMemFree(closest);
++    if (FAILED(hr)) goto fail;
++
++    hr = IAudioClient_GetDevicePeriod(client, &default_period, &minimum_period);
++    ok(hr == S_OK, "GetDevicePeriod(%s,%u) failed: %#lx.\n", kind, channels, hr);
++    if (FAILED(hr)) goto fail;
++    period = default_period > minimum_period ? default_period : minimum_period;
++    if (!period)
++    {
++        skip("Shared %s %u-channel endpoint returned a zero period.\n", kind, channels);
++        goto skip_cleanup;
++    }
++
++    /* Shared streams require zero periodicity; their duration need not match it. */
++    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
++            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period + 1, 0, &format.Format, NULL);
++    if (is_unavailable(hr))
++    {
++        skip("Shared %s %u-channel Initialize is unavailable: %#lx.\n", kind, channels, hr);
++        goto skip_cleanup;
++    }
++    ok(hr == S_OK, "Initialize(shared event %s,%u; unequal timing) failed: %#lx.\n",
++       kind, channels, hr);
++    if (FAILED(hr)) goto fail;
++
++    hr = IAudioClient_GetBufferSize(client, &frames);
++    ok(hr == S_OK && frames > 1, "GetBufferSize(%s,%u) returned %#lx, %u frames.\n",
++       kind, channels, hr, frames);
++    if (FAILED(hr) || frames <= 1) goto fail;
++
++    hr = IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&render);
++    ok(hr == S_OK, "GetService(render %s,%u) failed: %#lx.\n", kind, channels, hr);
++    if (FAILED(hr)) goto fail;
++
++    event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    ok(!!event, "CreateEvent(%s,%u) failed.\n", kind, channels);
++    if (!event) goto fail;
++    hr = IAudioClient_SetEventHandle(client, event);
++    ok(hr == S_OK, "SetEventHandle(%s,%u) failed: %#lx.\n", kind, channels, hr);
++    if (FAILED(hr)) goto fail;
++
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Start(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++    if (FAILED(hr)) goto fail;
++    started = TRUE;
++
++    for (i = 0; i < 2; ++i)
++        if (!wait_event(event, i, 1000)) goto fail;
++
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK && padding <= frames, "Padding(shared event %s,%u) returned %#lx, %u/%u.\n",
++       kind, channels, hr, padding, frames);
++    if (FAILED(hr) || padding > frames) goto fail;
++
++    /* Exercise the shared render contract after an event without imposing the
++     * exclusive whole-buffer rule. */
++    available = frames - padding;
++    request = available > 64 ? 64 : available;
++    if (request)
++    {
++        hr = IAudioRenderClient_GetBuffer(render, request, &data);
++        ok(hr == S_OK && data != NULL, "GetBuffer(shared event %s,%u,%u) returned %#lx, %p.\n",
++           kind, channels, request, hr, data);
++        if (SUCCEEDED(hr))
++        {
++            hr = IAudioRenderClient_ReleaseBuffer(render, request, AUDCLNT_BUFFERFLAGS_SILENT);
++            ok(hr == S_OK, "ReleaseBuffer(shared event %s,%u,%u) failed: %#lx.\n",
++               kind, channels, request, hr);
++        }
++    }
++    else
++        trace("Shared event %s,%u had a full buffer after its callback; no write was attempted.\n",
++              kind, channels);
++
++    hr = IAudioClient_Reset(client);
++    ok(hr == AUDCLNT_E_NOT_STOPPED, "Reset while running (%s,%u) returned %#lx.\n",
++       kind, channels, hr);
++    hr = IAudioClient_Stop(client);
++    ok(hr == S_OK, "Stop(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++    started = FALSE;
++    hr = IAudioClient_Reset(client);
++    ok(hr == S_OK, "Reset(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK && !padding, "Padding after reset (%s,%u) returned %#lx, %u.\n",
++       kind, channels, hr, padding);
++
++    /* A reset stream must be restartable and deliver a fresh callback. */
++    ok(ResetEvent(event), "ResetEvent before restart (%s,%u) failed.\n", kind, channels);
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Restart(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++    if (SUCCEEDED(hr))
++    {
++        started = TRUE;
++        wait_event(event, 2, 1000);
++        hr = IAudioClient_Stop(client);
++        ok(hr == S_OK, "Second Stop(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++        started = FALSE;
++    }
++    hr = IAudioClient_Reset(client);
++    ok(hr == S_OK, "Final Reset(shared event %s,%u) failed: %#lx.\n", kind, channels, hr);
++    trace("Shared event %s,%u lifecycle passed.\n", kind, channels);
++    CloseHandle(event);
++    IAudioRenderClient_Release(render);
++    IAudioClient_Release(client);
++    return TRUE;
++
++skip_cleanup:
++    if (event) CloseHandle(event);
++    if (render) IAudioRenderClient_Release(render);
++    IAudioClient_Release(client);
++    return TRUE;
++
++fail:
++    if (started) IAudioClient_Stop(client);
++    if (event) CloseHandle(event);
++    if (render) IAudioRenderClient_Release(render);
++    IAudioClient_Release(client);
++    return FALSE;
++}
++
++static int lifecycle_env_mode(char *endpoint, DWORD endpoint_size,
++                              char *marker, DWORD marker_size)
++{
++    DWORD endpoint_len, marker_len;
++
++    endpoint_len = GetEnvironmentVariableA("PROTON_BM_ENDPOINT_NAME", endpoint, endpoint_size);
++    marker_len = GetEnvironmentVariableA("PROTON_BM_REMOVED_MARKER", marker, marker_size);
++    if (!endpoint_len && !marker_len)
++        return 0;
++    ok(endpoint_len && marker_len && endpoint_len < endpoint_size && marker_len < marker_size,
++       "Lifecycle requires complete PROTON_BM_ENDPOINT_NAME and PROTON_BM_REMOVED_MARKER.\n");
++    return endpoint_len && marker_len && endpoint_len < endpoint_size && marker_len < marker_size ? 1 : -1;
++}
++
++static HRESULT find_lifecycle_endpoint(IMMDeviceEnumerator *enumerator,
++                                       const char *endpoint_name, IMMDevice **out)
++{
++    IMMDeviceCollection *collection = NULL;
++    IPropertyStore *store = NULL;
++    IMMDevice *device = NULL;
++    PROPVARIANT value;
++    WCHAR target[256];
++    UINT count, i, matches = 0;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!MultiByteToWideChar(CP_UTF8, 0, endpoint_name, -1, target, ARRAY_SIZE(target)))
++        return E_INVALIDARG;
++    hr = IMMDeviceEnumerator_EnumAudioEndpoints(enumerator, eRender, DEVICE_STATE_ACTIVE,
++                                                 &collection);
++    if (FAILED(hr)) return hr;
++    hr = IMMDeviceCollection_GetCount(collection, &count);
++    if (FAILED(hr)) goto done;
++    for (i = 0; i < count; ++i)
++    {
++        PropVariantInit(&value);
++        if (FAILED(IMMDeviceCollection_Item(collection, i, &device)))
++            continue;
++        if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &store)) &&
++            SUCCEEDED(IPropertyStore_GetValue(store,
++                (const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &value)) &&
++            value.vt == VT_LPWSTR && value.pwszVal && !lstrcmpW(value.pwszVal, target))
++        {
++            ++matches;
++            if (matches == 1)
++            {
++                *out = device;
++                device = NULL;
++            }
++        }
++        PropVariantClear(&value);
++        if (store) IPropertyStore_Release(store);
++        store = NULL;
++        if (device) IMMDevice_Release(device);
++        device = NULL;
++    }
++    ok(matches == 1, "Lifecycle endpoint %s matched %u active render endpoints.\n",
++       endpoint_name, matches);
++    if (matches != 1 && *out)
++    {
++        IMMDevice_Release(*out);
++        *out = NULL;
++    }
++    hr = matches == 1 ? S_OK : E_FAIL;
++
++done:
++    if (device) IMMDevice_Release(device);
++    if (store) IPropertyStore_Release(store);
++    IMMDeviceCollection_Release(collection);
++    return hr;
++}
++
++static BOOL wait_lifecycle_marker(const char *marker)
++{
++    UINT i;
++
++    for (i = 0; i < 3000; ++i)
++    {
++        if (GetFileAttributesA(marker) != INVALID_FILE_ATTRIBUTES)
++            return TRUE;
++        Sleep(10);
++    }
++    return FALSE;
++}
++
++static BOOL wait_lifecycle_invalidation(IAudioClient *client, HRESULT *padding_hr)
++{
++    UINT32 padding;
++    UINT i;
++
++    for (i = 0; i < 300; ++i)
++    {
++        *padding_hr = IAudioClient_GetCurrentPadding(client, &padding);
++        if (*padding_hr == AUDCLNT_E_DEVICE_INVALIDATED)
++            return TRUE;
++        Sleep(10);
++    }
++    return FALSE;
++}
++
++/* Host-coordinated endpoint check.  It is called only when both opt-in
++ * variables are complete, so the normal default-endpoint matrix is skipped
++ * and no physical default output is opened. */
++static void test_lifecycle_removal(IMMDeviceEnumerator *enumerator,
++                                   const char *endpoint_name, const char *marker)
++{
++    IMMDevice *device = NULL;
++    IAudioClient *client = NULL;
++    IAudioRenderClient *render = NULL;
++    WAVEFORMATEX *format = NULL;
++    REFERENCE_TIME default_period, minimum_period, period;
++    UINT32 frames, padding;
++    HANDLE event = NULL;
++    HRESULT hr, padding_hr, buffer_hr;
++    BOOL started = FALSE;
++    BOOL held_buffer = FALSE;
++    BYTE *held_data = NULL;
++
++    trace("Running opt-in PipeWire lifecycle check for %s.\n", endpoint_name);
++    hr = find_lifecycle_endpoint(enumerator, endpoint_name, &device);
++    ok(hr == S_OK, "Lifecycle endpoint lookup failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
++                            (void **)&client);
++    ok(hr == S_OK, "Lifecycle activation failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetMixFormat(client, &format);
++    ok(hr == S_OK && format, "Lifecycle GetMixFormat failed: %#lx.\n", hr);
++    if (FAILED(hr) || !format) goto done;
++    hr = IAudioClient_GetDevicePeriod(client, &default_period, &minimum_period);
++    ok(hr == S_OK, "Lifecycle GetDevicePeriod failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    period = default_period > minimum_period ? default_period : minimum_period;
++    if (!period)
++    {
++        ok(FALSE, "Lifecycle endpoint returned a zero period.\n");
++        goto done;
++    }
++    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
++                                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
++                                 period + 1, 0, format, NULL);
++    ok(hr == S_OK, "Lifecycle Initialize failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetBufferSize(client, &frames);
++    ok(hr == S_OK && frames > 1, "Lifecycle GetBufferSize failed: %#lx, %u.\n", hr, frames);
++    if (FAILED(hr) || frames <= 1) goto done;
++    hr = IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&render);
++    ok(hr == S_OK, "Lifecycle GetService failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    ok(!!event, "Lifecycle CreateEvent failed.\n");
++    if (!event) goto done;
++    hr = IAudioClient_SetEventHandle(client, event);
++    ok(hr == S_OK, "Lifecycle SetEventHandle failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Lifecycle Start failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    started = TRUE;
++    if (!wait_event(event, 0, 1000)) goto done;
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK, "Lifecycle post-Start padding failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = IAudioClient_Stop(client);
++    ok(hr == S_OK, "Lifecycle Stop failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    started = FALSE;
++    hr = IAudioClient_Reset(client);
++    ok(hr == S_OK, "Lifecycle Reset failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK && !padding, "Lifecycle reset padding failed: %#lx, %u.\n", hr, padding);
++    if (FAILED(hr) || padding) goto done;
++    ok(ResetEvent(event), "Lifecycle ResetEvent failed.\n");
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Lifecycle restart failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    started = TRUE;
++    if (!wait_event(event, 1, 1000)) goto done;
++    hr = IAudioClient_GetCurrentPadding(client, &padding);
++    ok(hr == S_OK, "Lifecycle post-restart padding failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = IAudioRenderClient_GetBuffer(render, 1, &held_data);
++    ok(hr == S_OK && held_data, "Lifecycle held GetBuffer returned %#lx, %p.\n",
++       hr, held_data);
++    if (FAILED(hr)) goto done;
++    held_buffer = TRUE;
++
++    printf("TEST_LIFECYCLE_READY\n");
++    fflush(stdout);
++    if (!wait_lifecycle_marker(marker))
++    {
++        ok(FALSE, "Lifecycle host did not remove the endpoint.\n");
++        goto done;
++    }
++    ok(wait_lifecycle_invalidation(client, &padding_hr),
++       "Lifecycle invalidation did not settle within the bounded poll.\n");
++    ok(padding_hr == AUDCLNT_E_DEVICE_INVALIDATED,
++       "Lifecycle removal padding returned %#lx, expected %#lx.\n",
++       padding_hr, AUDCLNT_E_DEVICE_INVALIDATED);
++
++    if (held_buffer)
++    {
++        hr = IAudioRenderClient_ReleaseBuffer(render, 1, 0);
++        ok(hr == AUDCLNT_E_DEVICE_INVALIDATED,
++           "Lifecycle held ReleaseBuffer returned %#lx, expected %#lx.\n",
++           hr, AUDCLNT_E_DEVICE_INVALIDATED);
++        held_buffer = FALSE;
++    }
++
++    held_data = NULL;
++    buffer_hr = IAudioRenderClient_GetBuffer(render, 1, &held_data);
++    ok(buffer_hr == AUDCLNT_E_DEVICE_INVALIDATED,
++       "Lifecycle removal GetBuffer returned %#lx, expected %#lx.\n",
++       buffer_hr, AUDCLNT_E_DEVICE_INVALIDATED);
++
++done:
++    if (held_buffer) IAudioRenderClient_ReleaseBuffer(render, 1, 0);
++    if (started) IAudioClient_Stop(client);
++    if (event) CloseHandle(event);
++    if (render) IAudioRenderClient_Release(render);
++    if (client) IAudioClient_Release(client);
++    CoTaskMemFree(format);
++    if (device) IMMDevice_Release(device);
++}
++
++START_TEST(exclusive_shared)
++{
++    IMMDeviceEnumerator *enumerator = NULL;
++    IMMDevice *device = NULL;
++    IAudioClient *client = NULL;
++    WAVEFORMATEX *mix = NULL;
++    char lifecycle_endpoint[256], lifecycle_marker[MAX_PATH];
++    int lifecycle_mode;
++    HRESULT hr;
++    UINT channels, formats;
++    static const UINT channel_counts[] = {2, 4, 6, 8};
++
++    CoInitialize(NULL);
++    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IMMDeviceEnumerator, (void **)&enumerator);
++    ok(hr == S_OK, "Enumerator creation failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    lifecycle_mode = lifecycle_env_mode(lifecycle_endpoint, sizeof(lifecycle_endpoint),
++                                         lifecycle_marker, sizeof(lifecycle_marker));
++    if (lifecycle_mode)
++    {
++        if (lifecycle_mode > 0)
++            test_lifecycle_removal(enumerator, lifecycle_endpoint, lifecycle_marker);
++        goto done;
++    }
++
++    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &device);
++    if (FAILED(hr))
++    {
++        skip("No render endpoint for shared event tests: %#lx.\n", hr);
++        goto done;
++    }
++
++    hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
++    ok(hr == S_OK, "Mix-format activation failed: %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetMixFormat(client, &mix);
++    ok(hr == S_OK && mix && mix->nSamplesPerSec, "GetMixFormat failed: %#lx.\n", hr);
++    if (FAILED(hr) || !mix || !mix->nSamplesPerSec) goto done;
++
++    trace("Shared EVENTCALLBACK matrix at %lu Hz; unsupported layouts are skips.\n",
++          (ULONG)mix->nSamplesPerSec);
++    for (channels = 0; channels < ARRAY_SIZE(channel_counts); ++channels)
++        for (formats = 0; formats < 2; ++formats)
++            test_shared_event_format(device, mix->nSamplesPerSec, channel_counts[channels], formats);
++
++done:
++    CoTaskMemFree(mix);
++    if (client) IAudioClient_Release(client);
++    if (device) IMMDevice_Release(device);
++    if (enumerator) IMMDeviceEnumerator_Release(enumerator);
++    CoUninitialize();
++}
+diff --git a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
+index cae9879f234c..1b37f7a4a302 100644
+--- a/dlls/winepipewire.drv/pipewire.c
++++ b/dlls/winepipewire.drv/pipewire.c
+@@ -88,6 +88,7 @@
+ #include "mult.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
++WINE_DECLARE_DEBUG_CHANNEL(pipewire_clock);
+ 
+ #define PW_CHANNELS_MAX 64
+ 
+@@ -179,6 +180,7 @@
+     UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
+     char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
+     BOOL pending_error;
++    BOOL error_reported;
+ 
+     DWORD flags;
+     AUDCLNT_SHAREMODE share;
+@@ -229,10 +231,13 @@
+     INT64 clock_lastpos, clock_written;
+     /* atomic: process callback relaxed-increments, timer/control relaxed-load */
+     UINT32 underrun_count, overrun_count, bad_buffer_count;
++    UINT32 max_request_frames, max_suggested_frames; /* atomic, callback-owned maxima */
++    UINT32 underrun_reported;
++    UINT64 underrun_log_time_usec;
+     UINT32 ring_warned;   /* RING_OP_* bits already reported for this stream */
+     UINT32 cb_seq;        /* callback-private: callbacks entered */
+     UINT32 cb_mark;       /* diagnostic breadcrumb, never read by the driver */
+-    BOOL underrun_logged, overrun_logged, bad_buffer_logged;
++    BOOL overrun_logged, bad_buffer_logged;
+ 
+     /* journal_w: producer counter, atomic, bumped from the PW callback.
+      * journal_r: consumer cursor, Wine threads only, under the loop lock. */
+@@ -292,6 +297,7 @@
+     struct list entry;
+     char *device;
+     UINT64 period_usec;
++    BOOL exclusive;
+     struct list streams;
+     HANDLE timer_thread;
+     LONG please_quit; /* atomic: release_stream store-release, timer load-acquire */
+@@ -305,6 +311,7 @@
+  * ---------------------------------------------------------------------- */
+ 
+ static struct pw_thread_loop *pw_loop_global;
++static struct spa_source *render_event;
+ static struct pw_context *pw_ctx;
+ static struct pw_core *pw_core_global;
+ static struct spa_hook core_listener;
+@@ -1038,6 +1045,13 @@
+     return S_OK;
+ }
+ 
++/* Native loop callback, with its lock held.  The data thread never takes
++ * that lock or calls Wine; the Wine worker signals the application event. */
++static void on_render_event(void *data, uint64_t count)
++{
++    pw_thread_loop_signal(pw_loop_global, false);
++}
++
+ static NTSTATUS pipewire_main_loop_start(void *args)
+ {
+     pthread_mutex_lock(&pw_init_mutex);
+@@ -1057,14 +1071,27 @@
+         pw_loop_global = NULL;
+         goto out;
+     }
++    if (!(render_event = pw_loop_add_event(pw_thread_loop_get_loop(pw_loop_global),
++                                          on_render_event, NULL)))
++    {
++        ERR("pw_loop_add_event failed\n");
++        goto failed;
++    }
+     if (pw_thread_loop_start(pw_loop_global) < 0)
+     {
+         ERR("pw_thread_loop_start failed\n");
+-        pw_context_destroy(pw_ctx);
+-        pw_ctx = NULL;
+-        pw_thread_loop_destroy(pw_loop_global);
+-        pw_loop_global = NULL;
+-    }
++        goto failed;
++    }
++    goto out;
++
++failed:
++    if (render_event)
++        pw_loop_destroy_source(pw_thread_loop_get_loop(pw_loop_global), render_event);
++    render_event = NULL;
++    pw_context_destroy(pw_ctx);
++    pw_ctx = NULL;
++    pw_thread_loop_destroy(pw_loop_global);
++    pw_loop_global = NULL;
+ 
+ out:
+     pthread_mutex_unlock(&pw_init_mutex);
+@@ -1094,6 +1121,8 @@
+             pw_context_destroy(pw_ctx);
+             pw_ctx = NULL;
+         }
++        pw_loop_destroy_source(pw_thread_loop_get_loop(pw_loop_global), render_event);
++        render_event = NULL;
+         pw_thread_loop_destroy(pw_loop_global);
+         pw_loop_global = NULL;
+     }
+@@ -1897,17 +1926,19 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static HRESULT pipewire_info_from_waveformat(struct pipewire_stream *stream, const WAVEFORMATEX *fmt);
++
+ static NTSTATUS pipewire_is_format_supported(void *args)
+ {
+     struct is_format_supported_params *params = args;
+-
+-    /* Shared-mode format conversion/resampling is the adapter's job, so we
+-     * accept any format here (mirrors winepulse).  Exclusive mode is not
+-     * supported. */
+-    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++    struct pipewire_stream stream = {0};
++
++    if (params->share == AUDCLNT_SHAREMODE_SHARED)
++        params->result = S_OK;
++    else if (params->flow != eRender)
+         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
+     else
+-        params->result = S_OK;
++        params->result = pipewire_info_from_waveformat(&stream, params->fmt_in);
+ 
+     return STATUS_SUCCESS;
+ }
+@@ -2386,6 +2417,7 @@
+     {
+         UINT32 maxsize = d->maxsize;
+         UINT32 req_frames, need_bytes, n, c;
++        SIZE_T held;
+         float vol[PW_CHANNELS_MAX];
+ 
+         if (!b->requested || b->requested > maxsize / stream->frame_size)
+@@ -2396,6 +2428,14 @@
+ 
+         if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
+         {
++            UINT32 suggested = min(b->requested, UINT32_MAX);
++
++            /* requested is a suggestion, not a capacity error. Record both
++             * it and the resolved size without changing playback. */
++            if (req_frames > __atomic_load_n(&stream->max_request_frames, __ATOMIC_RELAXED))
++                __atomic_store_n(&stream->max_request_frames, req_frames, __ATOMIC_RELAXED);
++            if (suggested > __atomic_load_n(&stream->max_suggested_frames, __ATOMIC_RELAXED))
++                __atomic_store_n(&stream->max_suggested_frames, suggested, __ATOMIC_RELAXED);
+             /* copy_from_ring wraps once, so a count above the ring size
+              * would read past the allocation. */
+             n = min(need_bytes, __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE));
+@@ -2411,7 +2451,11 @@
+                 __atomic_add_fetch(&stream->underrun_count, 1, __ATOMIC_RELAXED);
+             }
+             stream->pa_offs_bytes = (stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
+-            __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
++            held = __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
++            if (n && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++                held <= stream->period_bytes)
++                pw_loop_signal_event(pw_thread_loop_get_loop(pw_loop_global), render_event);
+         }
+         else
+             silence_buffer(stream->info.format, d->data, need_bytes);
+@@ -2518,16 +2562,17 @@
+     stream_journal_flush(stream);
+     if (stream->pending_error)
+     {
+-        if (stream->pw)
+-            st = pw_stream_get_state(stream->pw, NULL);
+-        else
+-            st = PW_STREAM_STATE_ERROR;
+-        WARN("stream %p saw error (now %s): %s.\n", stream,
+-             pw_stream_state_as_string(st),
+-             debugstr_a(stream->last_error[0] ? stream->last_error : NULL));
+-        stream->pending_error = FALSE;
+-    }
+-    if (!stream->pw)
++        if (!stream->error_reported)
++        {
++            st = stream->pw ? pw_stream_get_state(stream->pw, NULL) : PW_STREAM_STATE_ERROR;
++            WARN("stream %p saw error (now %s): %s.\n", stream,
++                 pw_stream_state_as_string(st),
++                 debugstr_a(stream->last_error[0] ? stream->last_error : NULL));
++            stream->error_reported = TRUE;
++        }
++        return FALSE;
++    }
++    if (!stream->pw || core_dead)
+         return FALSE;
+     st = pw_stream_get_state(stream->pw, NULL);
+     return st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING;
+@@ -2544,29 +2589,37 @@
+ 
+ /* Called with the loop lock held.  Waits out CONNECTING so the caller sees a
+  * stream that has either negotiated or failed, never one still in flight. */
+-static HRESULT stream_await_ready(struct pipewire_stream *stream)
++static HRESULT stream_await_ready(struct pipewire_stream *stream, BOOL active)
+ {
+     enum pw_stream_state st;
++    struct timespec deadline;
+     const char *error = NULL;
+-    int tries;
+-
+-    for (tries = 0; tries < 10; tries++)
+-    {
+-        st = pw_stream_get_state(stream->pw, NULL);
+-        if (st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING)
++    int wait_result = 0;
++
++    if (pw_thread_loop_get_time(pw_loop_global, &deadline, 1000000000) < 0)
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    for (;;)
++    {
++        if (!stream->pw || core_dead)
++            return active ? AUDCLNT_E_DEVICE_INVALIDATED : AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        if (stream->pending_error)
++        {
++            if (!active) return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++            return stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE ?
++                   AUDCLNT_E_DEVICE_IN_USE : AUDCLNT_E_DEVICE_INVALIDATED;
++        }
++        st = pw_stream_get_state(stream->pw, &error);
++        if (st == PW_STREAM_STATE_STREAMING || (!active && st == PW_STREAM_STATE_PAUSED))
+             return S_OK;
+         if (st == PW_STREAM_STATE_ERROR || st == PW_STREAM_STATE_UNCONNECTED)
+         {
+-            pw_stream_get_state(stream->pw, &error);
+             WARN("stream %p connect failed: %s.\n", stream, debugstr_a(error));
+             return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+         }
+-        if (pw_thread_loop_timed_wait(pw_loop_global, 1) != 0)
++        if (wait_result)
+             break;
+-    }
+-    st = pw_stream_get_state(stream->pw, &error);
+-    if (st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING)
+-        return S_OK;
++        wait_result = pw_thread_loop_timed_wait_full(pw_loop_global, &deadline);
++    }
+     WARN("stream %p connect timed out in state %d: %s.\n", stream, st, debugstr_a(error));
+     return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+ }
+@@ -2720,6 +2773,8 @@
+     }
+     pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u",
+                        (UINT32)period_frames, stream->info.rate);
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++        pw_properties_set(props, PW_KEY_NODE_EXCLUSIVE, "true");
+     if (device && device[0])
+         pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
+     if (stream->dataflow == eCapture &&
+@@ -2749,9 +2804,12 @@
+     }
+ 
+     {
++        /* WASAPI clients reopen lost endpoints; do not silently reconnect
++         * the old stream after its target disappears. */
+         enum pw_stream_flags flags = PW_STREAM_FLAG_AUTOCONNECT |
+                                      PW_STREAM_FLAG_MAP_BUFFERS |
+-                                     PW_STREAM_FLAG_INACTIVE;
++                                     PW_STREAM_FLAG_INACTIVE |
++                                     PW_STREAM_FLAG_DONT_RECONNECT;
+         enum pw_direction dir = stream->dataflow == eRender ?
+                                 PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT;
+         UINT64 rt_soft, rt_hard;
+@@ -2796,7 +2854,7 @@
+             return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+         }
+ 
+-        if (FAILED(hr = stream_await_ready(stream)))
++        if (FAILED(hr = stream_await_ready(stream, FALSE)))
+             return hr;
+ 
+         /* Covers the process that started with a healthy budget and was
+@@ -2823,7 +2881,7 @@
+                 WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
+                 return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+             }
+-            if (FAILED(hr = stream_await_ready(stream)))
++            if (FAILED(hr = stream_await_ready(stream, FALSE)))
+                 return hr;
+         }
+     }
+@@ -2920,9 +2978,9 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
+-    {
+-        TRACE("Exclusive mode not supported.\n");
++    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++        (params->flow != eRender || !(params->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)))
++    {
+         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
+         return STATUS_SUCCESS;
+     }
+@@ -3007,6 +3065,16 @@
+             goto exit;
+         }
+         stream->bufsize_frames = (SIZE_T)frames;
++    }
++
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++    {
++        /* Event-driven exclusive streams exchange a complete buffer each
++         * period.  Keep the timer and buffer on the same whole-frame grid. */
++        stream->period_bytes = bufsize_bytes;
++        stream->mmdev_period_usec = (stream->bufsize_frames * (UINT64)1000000 +
++                                    stream->info.rate / 2) / stream->info.rate;
+     }
+ 
+     hr = pipewire_stream_connect(stream, params->device, params->name);
+@@ -3169,8 +3237,11 @@
+               stream->cb_seq, mark & 3, debugstr_a(err));
+         if (under || over || bad)
+             WARN("stream %p underran %u times, overran %u times, bad buffers %u, "
+-                 "cb_seq %u last phase %u last_error %s.\n", stream,
+-                 under, over, bad, stream->cb_seq, mark & 3, debugstr_a(err));
++                 "cb_seq %u last phase %u last_error %s, max_req_frames %u, max_suggested_frames %u, "
++                 "ring_frames %lu.\n", stream, under, over, bad, stream->cb_seq, mark & 3, debugstr_a(err),
++                 __atomic_load_n(&stream->max_request_frames, __ATOMIC_RELAXED),
++                 __atomic_load_n(&stream->max_suggested_frames, __ATOMIC_RELAXED),
++                 (unsigned long)(stream->real_bufsize_bytes / stream->frame_size));
+     }
+     if (stream->period)
+     {
+@@ -3187,6 +3258,7 @@
+         {
+             list_remove(&period->entry);
+             __atomic_store_n(&period->please_quit, 1, __ATOMIC_RELEASE);
++            pw_thread_loop_signal(pw_loop_global, false);
+             dead_period = period;
+         }
+     }
+@@ -3273,7 +3345,7 @@
+     while ((slot = cap_claim_slot(stream, &idx, &seq)))
+     {
+         ACPacket *p, *next;
+-        LARGE_INTEGER stamp, freq;
++        LARGE_INTEGER stamp;
+ 
+         if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
+         {
+@@ -3296,8 +3368,9 @@
+         {
+             stream->held_bytes += stream->period_bytes;
+         }
+-        NtQueryPerformanceCounter(&stamp, &freq);
+-        p->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
++        /* Wine performance counters are already expressed in 100 ns units. */
++        NtQueryPerformanceCounter(&stamp, NULL);
++        p->qpcpos = stamp.QuadPart;
+         /* Two kinds of loss, each attributed to the packet that follows it.
+          * An eviction removes a sequence number, so an unexpected sequence
+          * means audio was lost immediately before this packet.  A clamp or an
+@@ -3319,6 +3392,15 @@
+     }
+ }
+ 
++/* Called with the loop lock held.  A coalesced native wake is sufficient:
++ * readiness follows the actual ring consumption, not the number of wakes. */
++static BOOL exclusive_render_ready(struct pipewire_stream *stream)
++{
++    return stream->started && stream->pw && !core_dead && !stream->pending_error &&
++           stream->held_bytes &&
++           __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <= stream->period_bytes;
++}
++
+ static void pipewire_period_timer_loop(void *args)
+ {
+     struct pipewire_period *period = args;
+@@ -3334,21 +3416,44 @@
+         INT64 adjust = 0;
+         int have_now = 0;
+ 
+-        NtDelayExecution(FALSE, &delay);
++        if (!period->exclusive) NtDelayExecution(FALSE, &delay);
+ 
+         pw_thread_loop_lock(pw_loop_global);
++        if (period->exclusive)
++        {
++            while (!__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
++            {
++                BOOL ready = FALSE;
++
++                LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
++                {
++                    stream_journal_flush(stream);
++                    if (exclusive_render_ready(stream)) ready = TRUE;
++                }
++                if (ready) break;
++                pw_thread_loop_wait(pw_loop_global);
++            }
++        }
++        if (__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
++        {
++            pw_thread_loop_unlock(pw_loop_global);
++            break;
++        }
+ 
+         if (period->timer_stream &&
+-            (!period->timer_stream->started || !period->timer_stream->pw))
++            (!period->timer_stream->started || !period->timer_stream->pw ||
++             period->timer_stream->pending_error ||
++             pw_stream_get_state(period->timer_stream->pw, NULL) != PW_STREAM_STATE_STREAMING))
+         {
+             period->timer_stream = NULL;
+             period->grid_valid = FALSE;
+         }
+-        if (!period->timer_stream)
++        if (!period->exclusive && !period->timer_stream)
+         {
+             LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+             {
+-                if (stream->started && stream->pw)
++                if (stream->started && stream->pw && !stream->pending_error &&
++                    pw_stream_get_state(stream->pw, NULL) == PW_STREAM_STATE_STREAMING)
+                 {
+                     period->timer_stream = stream;
+                     period->grid_valid = FALSE;
+@@ -3424,15 +3529,25 @@
+ 
+         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
+         {
+-            if (!stream->started)
++            if (!stream->started || !stream->pw || core_dead || stream->pending_error)
+                 continue;
+             if (stream->dataflow == eRender)
+             {
+                 UINT32 adv = min(stream->period_bytes, stream->held_bytes);
+ 
++                /* Exclusive event streams swap whole buffers.  The second
++                 * half of the ring is available only after PipeWire has
++                 * consumed the preceding half, not merely after a timer tick. */
++                if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                    (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++                    __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) > stream->period_bytes)
++                    adv = 0;
++
+                 stream->lcl_offs_bytes += adv;
+                 stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                 stream->held_bytes -= adv;
++                if (adv && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->event)
++                    NtSetEvent(stream->event, NULL);
+             }
+             else
+                 pipewire_read(stream);
+@@ -3447,10 +3562,27 @@
+             stream_journal_flush(stream);
+ 
+             if ((n = __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED)) &&
+-                !stream->underrun_logged)
++                n != stream->underrun_reported)
+             {
+-                WARN("stream %p first underrun (count %u).\n", stream, n);
+-                stream->underrun_logged = TRUE;
++                struct timespec ts;
++                UINT64 now;
++
++                if (!clock_gettime(CLOCK_MONOTONIC, &ts))
++                {
++                    now = (UINT64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++                    /* Report changed totals at most once a second. Logging
++                     * remains on the Wine worker, never the process callback. */
++                    if (!stream->underrun_reported || now - stream->underrun_log_time_usec >= 1000000)
++                    {
++                        WARN("stream %p %sunderrun (count %u), max_req_frames %u, max_suggested_frames %u, "
++                             "ring_frames %lu.\n", stream, stream->underrun_reported ? "" : "first ", n,
++                             __atomic_load_n(&stream->max_request_frames, __ATOMIC_RELAXED),
++                             __atomic_load_n(&stream->max_suggested_frames, __ATOMIC_RELAXED),
++                             (unsigned long)(stream->real_bufsize_bytes / stream->frame_size));
++                        stream->underrun_reported = n;
++                        stream->underrun_log_time_usec = now;
++                    }
++                }
+             }
+             if ((n = __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED)) &&
+                 !stream->overrun_logged)
+@@ -3464,7 +3596,9 @@
+                 WARN("stream %p first bad process buffer (count %u).\n", stream, n);
+                 stream->bad_buffer_logged = TRUE;
+             }
+-            if (stream->event)
++            if (stream->started && !stream->pending_error && stream->event &&
++                !(stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                  stream->dataflow == eRender))
+                 NtSetEvent(stream->event, NULL);
+         }
+ 
+@@ -3478,13 +3612,17 @@
+ {
+     static const WCHAR name[] = {'w','i','n','e','p','i','p','e','w','i','r','e','_','t','i','m','e','r',0};
+     struct pipewire_period *period;
++    BOOL exclusive = stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                     stream->dataflow == eRender &&
++                     (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
+ 
+     if (stream->period)
+         return S_OK;
+ 
+     LIST_FOR_EACH_ENTRY(period, &active_periods, struct pipewire_period, entry)
+     {
+-        if (period->period_usec == stream->mmdev_period_usec && !strcmp(period->device, stream->device))
++        if (period->exclusive == exclusive && period->period_usec == stream->mmdev_period_usec &&
++            !strcmp(period->device, stream->device))
+         {
+             stream->period = period;
+             list_add_tail(&period->streams, &stream->period_entry);
+@@ -3502,6 +3640,7 @@
+         return E_OUTOFMEMORY;
+     }
+     period->period_usec = stream->mmdev_period_usec;
++    period->exclusive = exclusive;
+     list_init(&period->streams);
+     stream->period = period;
+     list_add_tail(&period->streams, &stream->period_entry);
+@@ -3527,6 +3666,7 @@
+ {
+     struct start_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
++    BOOL defer_started;
+ 
+     TRACE("stream %p.\n", stream);
+     params->result = S_OK;
+@@ -3534,7 +3674,7 @@
+     if (!stream_valid(stream))
+     {
+         pw_thread_loop_unlock(pw_loop_global);
+-        params->result = S_OK;
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -3552,11 +3692,16 @@
+         return STATUS_SUCCESS;
+     }
+ 
++    defer_started = stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                    stream->dataflow == eRender &&
++                    (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
++
+     /* Publish started before activating: once the node is active the process
+      * callback may run, and it must not see a started=FALSE stream that is
+-     * already producing.  set_active still precedes add_stream_to_period so a
+-     * failed activation cannot leave the stream linked into the period. */
+-    __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
++     * already producing.  Exclusive event render is the exception: its
++     * callback emits silence until readiness and period registration finish. */
++    if (!defer_started)
++        __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
+ 
+     if (pw_stream_set_active(stream->pw, true) < 0)
+     {
+@@ -3568,6 +3713,14 @@
+         return STATUS_SUCCESS;
+     }
+ 
++    if (FAILED(params->result = stream_await_ready(stream, TRUE)))
++    {
++        if (stream->pw) pw_stream_set_active(stream->pw, false);
++        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++        pw_thread_loop_unlock(pw_loop_global);
++        return STATUS_SUCCESS;
++    }
++
+     if (FAILED(params->result = pipewire_add_stream_to_period(stream)))
+     {
+         if (pw_stream_set_active(stream->pw, false) < 0)
+@@ -3575,6 +3728,17 @@
+         __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
+         pw_thread_loop_unlock(pw_loop_global);
+         return STATUS_SUCCESS;
++    }
++
++    if (defer_started)
++        __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
++
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->event)
++    {
++        if (!stream->held_bytes &&
++            __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <= stream->period_bytes)
++            NtSetEvent(stream->event, NULL);
++        pw_thread_loop_signal(pw_loop_global, false);
+     }
+ 
+     pw_thread_loop_unlock(pw_loop_global);
+@@ -3847,6 +4011,15 @@
+         return STATUS_SUCCESS;
+     }
+ 
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++        params->frames != stream->bufsize_frames)
++    {
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = AUDCLNT_E_BUFFER_SIZE_ERROR;
++        return STATUS_SUCCESS;
++    }
++
+     if (stream->held_bytes / stream->frame_size + params->frames > stream->bufsize_frames)
+     {
+         pw_thread_loop_unlock(pw_loop_global);
+@@ -3905,6 +4078,21 @@
+     BYTE *buffer;
+ 
+     pw_thread_loop_lock(pw_loop_global);
++    if (stream->locked && params->written_frames && !stream_valid(stream))
++    {
++        stream->locked = 0;
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++    if (stream->locked && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++        params->written_frames != stream->bufsize_frames)
++    {
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = AUDCLNT_E_BUFFER_SIZE_ERROR;
++        return STATUS_SUCCESS;
++    }
+     if (!stream->locked || !params->written_frames)
+     {
+         stream->locked = 0;
+@@ -3964,6 +4152,9 @@
+         __atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE);
+     stream->clock_written += written_bytes;
+     stream->locked = 0;
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        pw_thread_loop_signal(pw_loop_global, false);
+ 
+     pw_thread_loop_unlock(pw_loop_global);
+     params->result = S_OK;
+@@ -4153,6 +4344,8 @@
+     if (stream->share == AUDCLNT_SHAREMODE_SHARED)
+         *params->freq *= stream->frame_size;
+     pw_thread_loop_unlock(pw_loop_global);
++    TRACE_(pipewire_clock)("stream %p, frequency %llu, result %#lx.\n",
++            stream, (unsigned long long)*params->freq, (unsigned long)S_OK);
+     params->result = S_OK;
+     return STATUS_SUCCESS;
+ }
+@@ -4161,6 +4354,7 @@
+ {
+     struct get_position_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
++    SIZE_T queued;
+ 
+     pw_thread_loop_lock(pw_loop_global);
+     if (!stream_valid(stream))
+@@ -4170,7 +4364,13 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    *params->pos = stream->clock_written - stream->held_bytes;
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->dataflow == eRender)
++    {
++        queued = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
++        *params->pos = stream->clock_written >= queued ? stream->clock_written - queued : 0;
++    }
++    else
++        *params->pos = stream->clock_written - stream->held_bytes;
+ 
+     if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
+         *params->pos /= stream->frame_size;
+@@ -4183,11 +4383,15 @@
+ 
+     if (params->qpctime)
+     {
+-        LARGE_INTEGER stamp, freq;
+-        NtQueryPerformanceCounter(&stamp, &freq);
+-        *params->qpctime = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+-    }
+-
++        LARGE_INTEGER stamp;
++        /* Wine performance counters are already expressed in 100 ns units. */
++        NtQueryPerformanceCounter(&stamp, NULL);
++        *params->qpctime = stamp.QuadPart;
++    }
++
++    TRACE_(pipewire_clock)("stream %p, device %u, position %llu, qpc %llu, qpc_present %u, result %#lx.\n",
++            stream, params->device, (unsigned long long)*params->pos,
++            params->qpctime ? (unsigned long long)*params->qpctime : 0, !!params->qpctime, (unsigned long)S_OK);
+     params->result = S_OK;
+     return STATUS_SUCCESS;
+ }

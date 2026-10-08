@@ -2037,6 +2037,8 @@ class Session:
         if "pipewire" not in self.compat_config:
             self.env.setdefault("WINE_AUDIO_DRIVER", "pulse,alsa")
 
+        self.env.setdefault("PROTON_MMDEV_FAKE_EXCLUSIVE", "0")
+
         if os.environ.get("SteamGameId", 0) in [
                 "462780", #Darksiders Warmastered Edition
                 ]:
