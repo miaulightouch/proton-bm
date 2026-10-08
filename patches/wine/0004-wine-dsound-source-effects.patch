@@ -1,0 +1,649 @@
+diff --git a/dlls/dsound/buffer.c b/dlls/dsound/buffer.c
+index c716e979b491..fdf959c7fd30 100644
+--- a/dlls/dsound/buffer.c
++++ b/dlls/dsound/buffer.c
+@@ -316,6 +316,7 @@
+ 	AcquireSRWLockExclusive(&This->lock);
+ 
+ 	This->playflags = flags;
++	This->filter_frames = 0;
+ 	if (This->state == STATE_STOPPED) {
+ 		This->state = STATE_STARTING;
+ 	}
+@@ -530,7 +531,7 @@
+ 		return DSERR_INVALIDPARAM;
+         }
+ 
+-	AcquireSRWLockShared(&This->lock);
++	AcquireSRWLockExclusive(&This->lock);
+ 
+ 	if (writecursor+writebytes <= This->buflen) {
+ 		*(LPBYTE*)lplpaudioptr1 = This->buffer->memory+writecursor;
+@@ -567,7 +568,7 @@
+                       audiobytes2 ? *audiobytes2: 0, writecursor);
+ 	}
+ 
+-	ReleaseSRWLockShared(&This->lock);
++	ReleaseSRWLockExclusive(&This->lock);
+ 
+ 	return DS_OK;
+ }
+@@ -589,6 +590,7 @@
+ 	/* start mixing from this new location instead */
+ 	newpos -= newpos%This->pwfx->nBlockAlign;
+ 	This->sec_mixpos = newpos;
++	This->filter_frames = 0;
+ 
+ 	This->use_committed = FALSE;
+ 	This->committed_mixpos = 0;
+@@ -671,7 +673,7 @@
+ 		AcquireSRWLockShared(&This->device->buffer_list_lock);
+ 		LIST_FOR_EACH_ENTRY(iter, &This->buffer->buffers, IDirectSoundBufferImpl, entry )
+ 		{
+-			AcquireSRWLockShared(&iter->lock);
++			AcquireSRWLockExclusive(&iter->lock);
+ 			if (x1)
+                         {
+ 			    if(x1 + (DWORD_PTR)p1 - (DWORD_PTR)iter->buffer->memory > iter->buflen)
+@@ -687,7 +689,7 @@
+ 			    else
+ 			      iter->buffer->lockedbytes -= x2;
+ 			}
+-			ReleaseSRWLockShared(&iter->lock);
++			ReleaseSRWLockExclusive(&iter->lock);
+ 		}
+ 		ReleaseSRWLockShared(&This->device->buffer_list_lock);
+ 	}
+@@ -737,173 +739,155 @@
+     return debugstr_guid(&desc->guidDSFXClass);
+ }
+ 
+-static HRESULT WINAPI IDirectSoundBufferImpl_SetFX(IDirectSoundBuffer8 *iface, DWORD dwEffectsCount,
+-        LPDSEFFECTDESC pDSFXDesc, DWORD *pdwResultCodes)
++static void free_filters(DSFilter *filters, DWORD count)
++{
++    DWORD i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (filters[i].obj) IMediaObject_Release(filters[i].obj);
++        if (filters[i].inplace) IMediaObjectInPlace_Release(filters[i].inplace);
++    }
++    free(filters);
++}
++
++static HRESULT WINAPI IDirectSoundBufferImpl_SetFX(IDirectSoundBuffer8 *iface, DWORD count,
++        LPDSEFFECTDESC desc, DWORD *results)
++{
++    IDirectSoundBufferImpl *This = impl_from_IDirectSoundBuffer8(iface);
++    DSFilter *filters, *old_filters;
++    DWORD i, old_count;
++    HRESULT hr = DS_OK, hr2;
++    DMO_MEDIA_TYPE type;
++    BOOL can_set;
++
++    TRACE("(%p,%lu,%p,%p)\n", This, count, desc, results);
++
++    if (results)
++        for (i = 0; i < count; ++i) results[i] = DSFXR_UNKNOWN;
++    if ((count && !desc) || (!count && (desc || results)))
++        return E_INVALIDARG;
++    if (!(This->dsbd.dwFlags & DSBCAPS_CTRLFX))
++        return DSERR_CONTROLUNAVAIL;
++
++    AcquireSRWLockShared(&This->lock);
++    can_set = This->state == STATE_STOPPED && !This->buffer->lockedbytes;
++    ReleaseSRWLockShared(&This->lock);
++    if (!can_set) return DSERR_INVALIDCALL;
++
++    filters = count ? calloc(count, sizeof(*filters)) : NULL;
++    if (count && !filters) return DSERR_OUTOFMEMORY;
++
++    type.majortype = KSDATAFORMAT_TYPE_AUDIO;
++    type.subtype = This->pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE ?
++            ((WAVEFORMATEXTENSIBLE *)This->pwfx)->SubFormat :
++            (This->pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ?
++            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM);
++    type.bFixedSizeSamples = TRUE;
++    type.bTemporalCompression = FALSE;
++    type.lSampleSize = This->pwfx->nBlockAlign;
++    type.formattype = FORMAT_WaveFormatEx;
++    type.pUnk = NULL;
++    type.cbFormat = sizeof(WAVEFORMATEX) + This->pwfx->cbSize;
++    type.pbFormat = (BYTE *)This->pwfx;
++
++    /* Construct external objects without holding the buffer lock. */
++    for (i = 0; i < count; ++i)
++    {
++        TRACE("%lu: %#lx, %s\n", i, desc[i].dwFlags, dump_DSFX_guid(&desc[i]));
++        filters[i].guid = desc[i].guidDSFXClass;
++        hr2 = CoCreateInstance(&desc[i].guidDSFXClass, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMediaObject, (void **)&filters[i].obj);
++        if (SUCCEEDED(hr2)) hr2 = IMediaObject_SetInputType(filters[i].obj, 0, &type, 0);
++        if (SUCCEEDED(hr2)) hr2 = IMediaObject_SetOutputType(filters[i].obj, 0, &type, 0);
++        if (FAILED(hr2))
++        {
++            if (SUCCEEDED(hr)) hr = hr2;
++            if (results) results[i] = hr2 == REGDB_E_CLASSNOTREG ? DSFXR_UNKNOWN : DSFXR_FAILED;
++        }
++        else
++        {
++            if (results) results[i] = DSFXR_LOCSOFTWARE;
++            IMediaObject_QueryInterface(filters[i].obj, &IID_IMediaObjectInPlace,
++                    (void **)&filters[i].inplace);
++        }
++    }
++    if (FAILED(hr)) goto failed;
++
++    AcquireSRWLockExclusive(&This->lock);
++    if (This->state != STATE_STOPPED || This->buffer->lockedbytes)
++    {
++        ReleaseSRWLockExclusive(&This->lock);
++        hr = DSERR_INVALIDCALL;
++        goto failed;
++    }
++    old_filters = This->filters;
++    old_count = This->num_filters;
++    This->filters = filters;
++    This->num_filters = count;
++    This->filter_frames = 0;
++    if (!count)
++    {
++        free(This->filter_buffer);
++        This->filter_buffer = NULL;
++        This->filter_buffer_len = 0;
++    }
++    ReleaseSRWLockExclusive(&This->lock);
++    free_filters(old_filters, old_count);
++    return DS_OK;
++
++failed:
++    if (results)
++        for (i = 0; i < count; ++i)
++            if (results[i] != DSFXR_UNKNOWN) results[i] = DSFXR_PRESENT;
++    free_filters(filters, count);
++    return hr;
++}
++
++static HRESULT WINAPI IDirectSoundBufferImpl_AcquireResources(IDirectSoundBuffer8 *iface,
++        DWORD dwFlags, DWORD dwEffectsCount, DWORD *pdwResultCodes)
+ {
+         IDirectSoundBufferImpl *This = impl_from_IDirectSoundBuffer8(iface);
+ 	DWORD u;
+-	DSFilter *filters;
+-	HRESULT hr, hr2;
+-	DMO_MEDIA_TYPE dmt;
+-	WAVEFORMATEX wfx;
+-
+-	TRACE("(%p,%lu,%p,%p)\n", This, dwEffectsCount, pDSFXDesc, pdwResultCodes);
++
++	FIXME("(%p,%08lu,%lu,%p): stub, faking success\n",This,dwFlags,dwEffectsCount,pdwResultCodes);
+ 
+ 	if (pdwResultCodes)
+ 		for (u=0; u<dwEffectsCount; u++) pdwResultCodes[u] = DSFXR_UNKNOWN;
+ 
+-	if ((dwEffectsCount > 0 && !pDSFXDesc) ||
+-		(dwEffectsCount == 0 && (pDSFXDesc || pdwResultCodes))
+-	)
+-		return E_INVALIDARG;
+-
+-	if (!(This->dsbd.dwFlags & DSBCAPS_CTRLFX)) {
+-		WARN("attempted to call SetFX on buffer without DSBCAPS_CTRLFX\n");
+-		return DSERR_CONTROLUNAVAIL;
+-	}
+-
+-	if (This->state != STATE_STOPPED)
+-		return DSERR_INVALIDCALL;
+-
+-	if (This->buffer->lockedbytes > 0)
+-		return DSERR_INVALIDCALL;
+-
+-	if (dwEffectsCount == 0) {
+-		if (This->num_filters > 0) {
+-			for (u = 0; u < This->num_filters; u++) {
+-				IMediaObject_Release(This->filters[u].obj);
+-			}
+-			free(This->filters);
+-
+-			This->filters = NULL;
+-			This->num_filters = 0;
+-		}
+-
+-		return DS_OK;
+-	}
+-
+-	filters = malloc(dwEffectsCount * sizeof(DSFilter));
+-	if (!filters) {
+-		WARN("out of memory\n");
+-		return DSERR_OUTOFMEMORY;
+-	}
+-
+-	hr = DS_OK;
+-
+-	wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+-	wfx.nChannels = This->pwfx->nChannels;
+-	wfx.nSamplesPerSec = This->pwfx->nSamplesPerSec;
+-	wfx.wBitsPerSample = sizeof(float) * 8;
+-	wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample)/8;
+-	wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+-	wfx.cbSize = sizeof(wfx);
+-
+-	dmt.majortype = KSDATAFORMAT_TYPE_AUDIO;
+-	dmt.subtype = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+-	dmt.bFixedSizeSamples = TRUE;
+-	dmt.bTemporalCompression = FALSE;
+-	dmt.lSampleSize = sizeof(float) * This->pwfx->nChannels / 8;
+-	dmt.formattype = FORMAT_WaveFormatEx;
+-	dmt.pUnk = NULL;
+-	dmt.cbFormat = sizeof(WAVEFORMATEX);
+-	dmt.pbFormat = (BYTE*)&wfx;
+-
+-	for (u = 0; u < dwEffectsCount; u++) {
+-		TRACE("%ld: 0x%08lx, %s\n", u, pDSFXDesc[u].dwFlags, dump_DSFX_guid(&pDSFXDesc[u]));
+-
+-		hr2 = CoCreateInstance(&pDSFXDesc[u].guidDSFXClass, NULL, CLSCTX_INPROC_SERVER, &IID_IMediaObject, (LPVOID*)&filters[u].obj);
+-
+-		if (SUCCEEDED(hr2)) {
+-			hr2 = IMediaObject_SetInputType(filters[u].obj, 0, &dmt, 0);
+-			if (FAILED(hr2))
+-				WARN("Could not set DMO input type\n");
+-		}
+-
+-		if (SUCCEEDED(hr2)) {
+-			hr2 = IMediaObject_SetOutputType(filters[u].obj, 0, &dmt, 0);
+-			if (FAILED(hr2))
+-				WARN("Could not set DMO output type\n");
+-		}
+-
+-		if (FAILED(hr2)) {
+-			if (hr == DS_OK)
+-				hr = hr2;
+-
+-			if (pdwResultCodes)
+-				pdwResultCodes[u] = (hr2 == REGDB_E_CLASSNOTREG) ? DSFXR_UNKNOWN : DSFXR_FAILED;
+-		} else {
+-			if (pdwResultCodes)
+-				pdwResultCodes[u] = DSFXR_LOCSOFTWARE;
+-		}
+-	}
+-
+-	if (FAILED(hr)) {
+-		for (u = 0; u < dwEffectsCount; u++) {
+-			if (pdwResultCodes)
+-				pdwResultCodes[u] = (pdwResultCodes[u] != DSFXR_UNKNOWN) ? DSFXR_PRESENT : DSFXR_UNKNOWN;
+-
+-			if (filters[u].obj)
+-				IMediaObject_Release(filters[u].obj);
+-		}
+-
+-		free(filters);
+-	} else {
+-		if (This->num_filters > 0) {
+-			for (u = 0; u < This->num_filters; u++) {
+-				IMediaObject_Release(This->filters[u].obj);
+-				if (This->filters[u].inplace) IMediaObjectInPlace_Release(This->filters[u].inplace);
+-			}
+-			free(This->filters);
+-		}
+-
+-		for (u = 0; u < dwEffectsCount; u++) {
+-			memcpy(&filters[u].guid, &pDSFXDesc[u].guidDSFXClass, sizeof(GUID));
+-			if (FAILED(IMediaObject_QueryInterface(filters[u].obj, &IID_IMediaObjectInPlace, (void*)&filters[u].inplace)))
+-				filters[u].inplace = NULL;
+-		}
+-
+-		This->filters = filters;
+-		This->num_filters = dwEffectsCount;
+-	}
+-
+-	return hr;
+-}
+-
+-static HRESULT WINAPI IDirectSoundBufferImpl_AcquireResources(IDirectSoundBuffer8 *iface,
+-        DWORD dwFlags, DWORD dwEffectsCount, DWORD *pdwResultCodes)
+-{
+-        IDirectSoundBufferImpl *This = impl_from_IDirectSoundBuffer8(iface);
+-	DWORD u;
+-
+-	FIXME("(%p,%08lu,%lu,%p): stub, faking success\n",This,dwFlags,dwEffectsCount,pdwResultCodes);
+-
+-	if (pdwResultCodes)
+-		for (u=0; u<dwEffectsCount; u++) pdwResultCodes[u] = DSFXR_UNKNOWN;
+-
+ 	WARN("control unavailable\n");
+ 	return DS_OK;
+ }
+ 
+ static HRESULT WINAPI IDirectSoundBufferImpl_GetObjectInPath(IDirectSoundBuffer8 *iface,
+-        REFGUID clsid, DWORD index, REFGUID iid, void **out)
++        REFGUID clsid, DWORD index, REFIID iid, void **out)
+ {
+     IDirectSoundBufferImpl *This = impl_from_IDirectSoundBuffer8(iface);
+     DWORD i, count = 0;
++    IMediaObject *object = NULL;
++    HRESULT hr;
+ 
+     TRACE("(%p,%s,%lu,%s,%p)\n", This, debugstr_guid(clsid), index, debugstr_guid(iid), out);
+ 
+-    if (!out)
+-        return E_INVALIDARG;
+-
+-    for (i = 0; i < This->num_filters; i++)
++    if (!out) return E_INVALIDARG;
++    AcquireSRWLockShared(&This->lock);
++    for (i = 0; i < This->num_filters; ++i)
+     {
+         if (IsEqualGUID(clsid, &This->filters[i].guid) || IsEqualGUID(clsid, &GUID_All_Objects))
+         {
+             if (count++ == index)
+-                return IMediaObject_QueryInterface(This->filters[i].obj, iid, out);
++            {
++                object = This->filters[i].obj;
++                IMediaObject_AddRef(object);
++                break;
++            }
+         }
+     }
+-    return DSERR_OBJECTNOTFOUND;
++    ReleaseSRWLockShared(&This->lock);
++    if (!object) return DSERR_OBJECTNOTFOUND;
++    hr = IMediaObject_QueryInterface(object, iid, out);
++    IMediaObject_Release(object);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI IDirectSoundBufferImpl_Initialize(IDirectSoundBuffer8 *iface,
+@@ -1181,15 +1165,9 @@
+     free(This->notifies);
+     free(This->pwfx);
+     free(This->committedbuff);
+-
+-    if (This->filters) {
+-        int i;
+-        for (i = 0; i < This->num_filters; i++) {
+-            IMediaObject_Release(This->filters[i].obj);
+-            if (This->filters[i].inplace) IMediaObjectInPlace_Release(This->filters[i].inplace);
+-        }
+-        free(This->filters);
+-    }
++    free(This->filter_buffer);
++
++    free_filters(This->filters, This->num_filters);
+ 
+     TRACE("(%p) released\n", This);
+ 
+@@ -1261,6 +1239,8 @@
+     dsb->committedbuff = committedbuff;
+     dsb->use_committed = FALSE;
+     dsb->committed_mixpos = 0;
++    dsb->filter_buffer = NULL;
++    dsb->filter_buffer_len = dsb->filter_frames = 0;
+     DSOUND_RecalcFormat(dsb);
+ 
+     InitializeSRWLock(&dsb->lock);
+diff --git a/dlls/dsound/dsound.c b/dlls/dsound/dsound.c
+index 9ae8af3fc8a0..7dfa7238e68e 100644
+--- a/dlls/dsound/dsound.c
++++ b/dlls/dsound/dsound.c
+@@ -530,6 +530,12 @@
+         return DSERR_INVALIDCALL;
+     }
+ 
++    if (((IDirectSoundBufferImpl *)psb)->dsbd.dwFlags & DSBCAPS_CTRLFX)
++    {
++        *ppdsb = NULL;
++        return DSERR_INVALIDCALL;
++    }
++
+     /* duplicate the actual buffer implementation */
+     hres = IDirectSoundBufferImpl_Duplicate(device, &dsb, (IDirectSoundBufferImpl*)psb);
+     if (hres == DS_OK)
+diff --git a/dlls/dsound/dsound_private.h b/dlls/dsound/dsound_private.h
+index dd699cc6e33f..771d1828476b 100644
+--- a/dlls/dsound/dsound_private.h
++++ b/dlls/dsound/dsound_private.h
+@@ -173,6 +173,8 @@
+     bitsputfunc put, put_aux;
+     int                         num_filters;
+     DSFilter*                   filters;
++    BYTE                        *filter_buffer;
++    DWORD                       filter_buffer_len, filter_frames;
+ 
+     struct list entry;
+ };
+diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
+index 97adc47331f0..fa178f25b419 100644
+--- a/dlls/dsound/mixer.c
++++ b/dlls/dsound/mixer.c
+@@ -295,9 +295,70 @@
+ static inline float get_current_sample(const IDirectSoundBufferImpl *dsb,
+         BYTE *buffer, DWORD buflen, DWORD mixpos, DWORD channel)
+ {
++    DWORD offset;
++
+     if (mixpos >= buflen && !(dsb->playflags & DSBPLAY_LOOPING))
+         return 0.0f;
++    if (dsb->num_filters)
++    {
++        offset = mixpos - (buffer == dsb->committedbuff ? dsb->committed_mixpos : dsb->sec_mixpos);
++        return dsb->get(dsb, dsb->filter_buffer + offset, channel);
++    }
+     return dsb->get(dsb, buffer + (mixpos % buflen), channel);
++}
++
++/* Effects consume the negotiated secondary format. Keep only the processed
++ * FIR lookahead so overlapping resampler reads never process a frame twice. */
++static BOOL prepare_filter_data(IDirectSoundBufferImpl *dsb, UINT frames)
++{
++    UINT stride = dsb->pwfx->nBlockAlign, committed = 0, i;
++    DWORD size, offset;
++    BYTE *buffer;
++    HRESULT hr;
++
++    if (!stride || frames > ~(DWORD)0 / stride)
++        return FALSE;
++    size = frames * stride;
++    if (size > dsb->filter_buffer_len)
++    {
++        if (!(buffer = realloc(dsb->filter_buffer, size)))
++            return FALSE;
++        dsb->filter_buffer = buffer;
++        dsb->filter_buffer_len = size;
++    }
++    if (frames <= dsb->filter_frames)
++        return TRUE;
++
++    if (dsb->use_committed)
++        committed = (dsb->writelead - dsb->committed_mixpos) / stride;
++    for (i = dsb->filter_frames; i < frames; ++i)
++    {
++        buffer = dsb->filter_buffer + i * stride;
++        if (i < committed)
++            memcpy(buffer, (BYTE *)dsb->committedbuff + dsb->committed_mixpos + i * stride, stride);
++        else
++        {
++            offset = dsb->sec_mixpos + i * stride;
++            if (offset >= dsb->buflen && !(dsb->playflags & DSBPLAY_LOOPING))
++                memset(buffer, dsb->pwfx->wBitsPerSample == 8 ? 0x80 : 0, stride);
++            else
++                memcpy(buffer, dsb->buffer->memory + offset % dsb->buflen, stride);
++        }
++    }
++
++    buffer = dsb->filter_buffer + dsb->filter_frames * stride;
++    size -= dsb->filter_frames * stride;
++    for (i = 0; i < dsb->num_filters; ++i)
++    {
++        if (dsb->filters[i].inplace)
++        {
++            hr = IMediaObjectInPlace_Process(dsb->filters[i].inplace, size, buffer, 0, DMO_INPLACE_NORMAL);
++            if (FAILED(hr)) WARN("IMediaObjectInPlace_Process failed for filter %u, hr %#lx.\n", i, hr);
++        }
++        else WARN("filter %u has no inplace object - unsupported\n", i);
++    }
++    dsb->filter_frames = frames;
++    return TRUE;
+ }
+ 
+ static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
+@@ -417,11 +478,37 @@
+ static void cp_fields(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *freqAccNum)
+ {
+     DWORD ipos, adv;
++    UINT64 required = count;
++
++    if (dsb->num_filters)
++    {
++        if (dsb->freqAdjustNum != dsb->freqAdjustDen)
++            required = (*freqAccNum + count * dsb->freqAdjustNum) / dsb->freqAdjustDen
++                    + (fir_len + dsb->firstep - 2) / dsb->firstep;
++        if (required > ~(UINT)0 || !prepare_filter_data(dsb, required))
++        {
++            WARN("Failed to allocate effect input.\n");
++            memset(dsb->device->tmp_buffer, 0, count * dsb->device->pwfx->nChannels * sizeof(float));
++            dsb->filter_frames = 0;
++            dsb->use_committed = FALSE;
++            dsb->committed_mixpos = 0;
++            dsb->state = STATE_STOPPED;
++            return;
++        }
++    }
+ 
+     if (dsb->freqAdjustNum == dsb->freqAdjustDen)
+         adv = cp_fields_noresample(dsb, count); /* *freqAccNum is unmodified */
+     else
+         adv = cp_fields_resample(dsb, count, freqAccNum);
++
++    if (dsb->num_filters)
++    {
++        dsb->filter_frames -= min(adv, dsb->filter_frames);
++        if (dsb->filter_frames)
++            memmove(dsb->filter_buffer, dsb->filter_buffer + adv * dsb->pwfx->nBlockAlign,
++                    dsb->filter_frames * dsb->pwfx->nBlockAlign);
++    }
+ 
+     ipos = dsb->sec_mixpos + adv * dsb->pwfx->nBlockAlign;
+     if (ipos >= dsb->buflen) {
+@@ -473,8 +560,6 @@
+ static void DSOUND_MixToTemporary(IDirectSoundBufferImpl *dsb, DWORD frames)
+ {
+ 	UINT size_bytes = frames * sizeof(float) * dsb->device->pwfx->nChannels;
+-	HRESULT hr;
+-	int i;
+ 
+ 	if (dsb->device->tmp_buffer_len < size_bytes || !dsb->device->tmp_buffer)
+ 	{
+@@ -485,18 +570,6 @@
+ 		memset(dsb->device->tmp_buffer, 0, dsb->device->tmp_buffer_len);
+ 
+ 	cp_fields(dsb, frames, &dsb->freqAccNum);
+-
+-	if (size_bytes > 0) {
+-		for (i = 0; i < dsb->num_filters; i++) {
+-			if (dsb->filters[i].inplace) {
+-				hr = IMediaObjectInPlace_Process(dsb->filters[i].inplace, size_bytes, (BYTE*)dsb->device->tmp_buffer, 0, DMO_INPLACE_NORMAL);
+-
+-				if (FAILED(hr))
+-					WARN("IMediaObjectInPlace_Process failed for filter %u\n", i);
+-			} else
+-				WARN("filter %u has no inplace object - unsupported\n", i);
+-		}
+-	}
+ }
+ 
+ static void DSOUND_MixerVol(const IDirectSoundBufferImpl *dsb, INT frames)
+diff --git a/dlls/dsound/tests/dsound8.c b/dlls/dsound/tests/dsound8.c
+index 07b10af45e0b..b4e8d4d65f5c 100644
+--- a/dlls/dsound/tests/dsound8.c
++++ b/dlls/dsound/tests/dsound8.c
+@@ -1298,7 +1298,7 @@
+     ok(!flags, "Got unexpected flags %#lx.\n", flags);
+ 
+     ok(IsEqualGUID(&type->majortype, &MEDIATYPE_Audio), "Got major type %s.\n", debugstr_guid(&type->majortype));
+-    todo_wine ok(IsEqualGUID(&type->subtype, &MEDIASUBTYPE_PCM), "Got subtype %s.\n", debugstr_guid(&type->subtype));
++    ok(IsEqualGUID(&type->subtype, &MEDIASUBTYPE_PCM), "Got subtype %s.\n", debugstr_guid(&type->subtype));
+     ok(type->bFixedSizeSamples == TRUE, "Got fixed size %d.\n", type->bFixedSizeSamples);
+     ok(!type->bTemporalCompression, "Got temporal compression %d.\n", type->bTemporalCompression);
+     ok(IsEqualGUID(&type->formattype, &FORMAT_WaveFormatEx), "Got format type %s.\n", debugstr_guid(&type->formattype));
+@@ -1306,7 +1306,7 @@
+     ok(type->cbFormat == sizeof(WAVEFORMATEX), "Got format size %lu.\n", type->cbFormat);
+ 
+     wfx = (WAVEFORMATEX *)type->pbFormat;
+-    todo_wine ok(type->lSampleSize == wfx->nBlockAlign, "Got sample size %lu.\n", type->lSampleSize);
++    ok(type->lSampleSize == wfx->nBlockAlign, "Got sample size %lu.\n", type->lSampleSize);
+ 
+     if (wfx->wBitsPerSample != 8)
+         return DMO_E_TYPE_NOT_ACCEPTED;
+@@ -1474,7 +1474,16 @@
+ static HRESULT WINAPI dmo_inplace_Process(IMediaObjectInPlace *iface, ULONG size,
+         BYTE *data, REFERENCE_TIME start, DWORD flags)
+ {
++    unsigned int i;
++
+     if (winetest_debug > 1) trace("Process(size %lu)\n", size);
++
++    ok(size && data, "Got size %lu and data %p.\n", size, data);
++    if (data)
++    {
++        for (i = 0; i < size && data[i] == 0x80; ++i);
++        ok(i == size, "Sample %u is not source-format PCM8 silence.\n", i);
++    }
+ 
+     ok(!start, "Got start time %s.\n", wine_dbgstr_longlong(start));
+     ok(!flags, "Got flags %#lx.\n", flags);
+@@ -1563,7 +1572,7 @@
+     IMediaObject *echo = NULL, *reverb = NULL;
+     IDirectSoundBuffer8 *buffer8;
+     DSEFFECTDESC effects[2] = {};
+-    IDirectSoundBuffer *buffer;
++    IDirectSoundBuffer *buffer, *duplicate;
+     IDirectSoundNotify *notify;
+     IDirectSound8 *dsound;
+     DWORD size1, size2;
+@@ -1604,6 +1613,11 @@
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+     hr = IDirectSoundBuffer_QueryInterface(buffer, &IID_IDirectSoundBuffer8, (void **)&buffer8);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
++    duplicate = NULL;
++    hr = IDirectSound8_DuplicateSoundBuffer(dsound, buffer, &duplicate);
++    ok(hr == DSERR_INVALIDCALL, "Got hr %#lx duplicating an effect buffer.\n", hr);
++    if (duplicate) IDirectSoundBuffer_Release(duplicate);
++
+     hr = IDirectSoundBuffer8_QueryInterface(buffer, &IID_IDirectSoundNotify, (void **)&notify);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+ 
+@@ -1755,26 +1769,26 @@
+     effects[0].guidDSFXClass = testdmo_clsid;
+     results[0] = 0xdeadbeef;
+     hr = IDirectSoundBuffer8_SetFX(buffer8, 1, effects, results);
+-    todo_wine ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+-    todo_wine ok(results[0] == DSFXR_LOCSOFTWARE, "Got result %#lx.\n", results[0]);
+-    todo_wine ok(!memcmp(&testdmo_input_type, &wfx, sizeof(WAVEFORMATEX)), "Format blocks didn't match.\n");
++    ok(hr == DS_OK, "Got hr %#lx.\n", hr);
++    ok(results[0] == DSFXR_LOCSOFTWARE, "Got result %#lx.\n", results[0]);
++    ok(!memcmp(&testdmo_input_type, &wfx, sizeof(WAVEFORMATEX)), "Format blocks didn't match.\n");
+ 
+     ResetEvent(notify_params.hEventNotify);
+     hr = IDirectSoundBuffer8_Play(buffer8, 0, 0, 0);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+-    todo_wine ok(got_Discontinuity == 1, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
+-
+-    todo_wine ok(!WaitForSingleObject(got_Process, 100), "Wait timed out.\n");
++    ok(got_Discontinuity == 1, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
++
++    ok(!WaitForSingleObject(got_Process, 100), "Wait timed out.\n");
+ 
+     hr = IDirectSoundBuffer8_Stop(buffer8);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+-    todo_wine ok(got_Discontinuity == 1, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
++    ok(got_Discontinuity == 1, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
+     ok(!WaitForSingleObject(notify_params.hEventNotify, 1000), "Wait timed out.\n");
+ 
+     ResetEvent(notify_params.hEventNotify);
+     hr = IDirectSoundBuffer8_Play(buffer8, 0, 0, 0);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
+-    todo_wine ok(got_Discontinuity == 2, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
++    ok(got_Discontinuity == 2, "Got %u calls to IMediaObject::Discontinuity().\n", got_Discontinuity);
+ 
+     hr = IDirectSoundBuffer8_Stop(buffer8);
+     ok(hr == DS_OK, "Got hr %#lx.\n", hr);
