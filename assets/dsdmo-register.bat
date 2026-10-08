@@ -1,7 +1,6 @@
 @echo off
 setlocal DisableDelayedExpansion
 if not exist "%~dp0dsdmo.dll" goto missing
-if not exist "%~dp0msdmo.dll" goto missing
 
 set "registrar=%SystemRoot%\System32\regsvr32.exe"
 if defined PROCESSOR_ARCHITEW6432 set "registrar=%SystemRoot%\Sysnative\regsvr32.exe"
@@ -11,14 +10,14 @@ echo This package needs a 64-bit Wine/Proton prefix. >&2
 exit /b 2
 
 :register
-set "WINEDLLOVERRIDES=dsdmo=n;msdmo=n"
+set "WINEDLLOVERRIDES=dsdmo=n;msdmo=b"
 "%registrar%" /s "%~dp0dsdmo.dll" || goto failed
-echo Native DMO registered. Keep both DLLs in this folder.
-echo Launch the game with WINEDLLOVERRIDES=dsdmo=n;msdmo=n and restart it.
+echo Native effects registered. Keep dsdmo.dll in this folder.
+echo Set WINEDLLOVERRIDES=dsdmo=n in the game launch settings.
 exit /b 0
 
 :missing
-echo Place matching x64 dsdmo.dll and msdmo.dll beside register.bat. >&2
+echo Place x64 dsdmo.dll beside dsdmo-register.bat. >&2
 exit /b 2
 
 :failed
