@@ -49,7 +49,7 @@ DIST_PREFIX := $(DST_DIR)/share/default_pfx/
 DIST_PREFIX_ARM64 := $(DST_DIR)/share/default_pfx_arm64/
 DIST_VERSION := $(DST_BASE)/version
 DEPLOY_DIR := ./deploy
-REDIST_DIR := ./redist
+REDIST_DIR := ./$(BUILD_NAME)
 
 HOST_CFLAGS    ?= -O2 -march=nocona -mtune=core-avx2
 CCOS_CFLAGS    := $(HOST_CFLAGS) -pipe
@@ -2046,7 +2046,6 @@ deploy: all
 redist: all
 	mkdir -p $(REDIST_DIR)
 	rsync --delete -arx $(DST_BASE)/ $(REDIST_DIR)
-	mv $(REDIST_DIR) $(BUILD_NAME)
 	XZ_OPT="-9 -T$(J)" tar -cvJf $(BUILD_NAME).tar.xz $(BUILD_NAME)
 	sha512sum $(BUILD_NAME).tar.xz > $(BUILD_NAME).sha512sum
 	@echo "Proton build available at $(BUILD_NAME).tar.xz"
