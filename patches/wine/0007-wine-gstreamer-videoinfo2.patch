@@ -1,0 +1,309 @@
+diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
+index 46a3d7e45d57..28835d5a8a8c 100644
+--- a/dlls/qasf/asfreader.c
++++ b/dlls/qasf/asfreader.c
+@@ -21,6 +21,7 @@
+ #include "qasf_private.h"
+ 
+ #include "mediaobj.h"
++#include "dvdmedia.h"
+ #include "propsys.h"
+ #include "initguid.h"
+ #include "wmsdkidl.h"
+@@ -233,16 +234,67 @@
+     return hr;
+ }
+ 
++static HRESULT asf_stream_convert_video_info2(AM_MEDIA_TYPE *media_type)
++{
++    const VIDEOINFOHEADER *video_format = (const VIDEOINFOHEADER *)media_type->pbFormat;
++    VIDEOINFOHEADER2 *video_format2;
++    size_t extra_size, format_size;
++
++    if (!IsEqualGUID(&media_type->majortype, &MEDIATYPE_Video)
++            || !IsEqualGUID(&media_type->formattype, &FORMAT_VideoInfo))
++        return S_FALSE;
++    if (!media_type->pbFormat || media_type->cbFormat < sizeof(*video_format))
++        return VFW_E_INVALIDMEDIATYPE;
++
++    extra_size = media_type->cbFormat - sizeof(*video_format);
++    if (extra_size > (size_t)-1 - sizeof(*video_format2)
++            || extra_size > (DWORD)-1 - sizeof(*video_format2))
++        return E_OUTOFMEMORY;
++    format_size = sizeof(*video_format2) + extra_size;
++    if (!(video_format2 = CoTaskMemAlloc(format_size)))
++        return E_OUTOFMEMORY;
++
++    memset(video_format2, 0, format_size);
++    video_format2->rcSource = video_format->rcSource;
++    video_format2->rcTarget = video_format->rcTarget;
++    video_format2->dwBitRate = video_format->dwBitRate;
++    video_format2->dwBitErrorRate = video_format->dwBitErrorRate;
++    video_format2->AvgTimePerFrame = video_format->AvgTimePerFrame;
++    video_format2->dwPictAspectRatioX = video_format->bmiHeader.biWidth < 0
++            ? -(DWORD)video_format->bmiHeader.biWidth : video_format->bmiHeader.biWidth;
++    video_format2->dwPictAspectRatioY = video_format->bmiHeader.biHeight < 0
++            ? -(DWORD)video_format->bmiHeader.biHeight : video_format->bmiHeader.biHeight;
++    video_format2->bmiHeader = video_format->bmiHeader;
++    memcpy(video_format2 + 1, video_format + 1, extra_size);
++
++    CoTaskMemFree(media_type->pbFormat);
++    media_type->formattype = FORMAT_VideoInfo2;
++    media_type->cbFormat = format_size;
++    media_type->pbFormat = (BYTE *)video_format2;
++    return S_OK;
++}
++
+ static HRESULT asf_stream_get_media_type(struct strmbase_pin *iface, unsigned int index, AM_MEDIA_TYPE *media_type)
+ {
+     struct asf_stream *stream = impl_from_strmbase_pin(iface);
+     struct asf_reader *filter = asf_reader_from_asf_stream(stream);
+     IWMOutputMediaProps *props;
+     WM_MEDIA_TYPE *mt;
+-    DWORD size;
++    DWORD size, format_count;
++    BOOL video_info2 = FALSE;
+     HRESULT hr;
+ 
+     TRACE("iface %p, index %u, media_type %p.\n", iface, index, media_type);
++
++    if (FAILED(IWMReader_GetOutputFormatCount(filter->reader, stream->index, &format_count)))
++        return VFW_S_NO_MORE_ITEMS;
++    if (index >= format_count)
++    {
++        index -= format_count;
++        video_info2 = TRUE;
++    }
++    if (index >= format_count)
++        return VFW_S_NO_MORE_ITEMS;
+ 
+     if (FAILED(IWMReader_GetOutputFormat(filter->reader, stream->index, index, &props)))
+         return VFW_S_NO_MORE_ITEMS;
+@@ -260,6 +312,16 @@
+     hr = IWMOutputMediaProps_GetMediaType(props, mt, &size);
+     if (SUCCEEDED(hr))
+         hr = CopyMediaType(media_type, (AM_MEDIA_TYPE *)mt);
++    if (SUCCEEDED(hr) && video_info2)
++    {
++        HRESULT convert_hr = asf_stream_convert_video_info2(media_type);
++
++        if (convert_hr != S_OK)
++        {
++            FreeMediaType(media_type);
++            hr = convert_hr == S_FALSE ? VFW_S_NO_MORE_ITEMS : convert_hr;
++        }
++    }
+ 
+     free(mt);
+     IWMOutputMediaProps_Release(props);
+@@ -623,6 +685,13 @@
+         VIDEOINFOHEADER *format = (VIDEOINFOHEADER *)stream->source.pin.mt.pbFormat;
+         buffer_size = format->bmiHeader.biSizeImage;
+     }
++    else if (IsEqualGUID(&stream->source.pin.mt.formattype, &FORMAT_VideoInfo2)
++            && stream->source.pin.mt.pbFormat
++            && stream->source.pin.mt.cbFormat >= sizeof(VIDEOINFOHEADER2))
++    {
++        VIDEOINFOHEADER2 *format = (VIDEOINFOHEADER2 *)stream->source.pin.mt.pbFormat;
++        buffer_size = format->bmiHeader.biSizeImage;
++    }
+     else if (IsEqualGUID(&stream->source.pin.mt.formattype, &FORMAT_WaveFormatEx)
+             && (IsEqualGUID(&stream->source.pin.mt.subtype, &MEDIASUBTYPE_PCM)
+             || IsEqualGUID(&stream->source.pin.mt.subtype, &MEDIASUBTYPE_IEEE_FLOAT)))
+diff --git a/dlls/winegstreamer/quartz_parser.c b/dlls/winegstreamer/quartz_parser.c
+index 4915ce7cc320..6aa5e75de779 100644
+--- a/dlls/winegstreamer/quartz_parser.c
++++ b/dlls/winegstreamer/quartz_parser.c
+@@ -565,9 +565,13 @@
+     }
+ }
+ 
+-static bool amt_from_wg_format_video(AM_MEDIA_TYPE *mt, const struct wg_format *format, bool wm)
++static bool amt_from_wg_format_video(AM_MEDIA_TYPE *mt, const struct wg_format *format, bool wm,
++        bool video_info2)
+ {
+     VIDEOINFO *video_format;
++    VIDEOINFOHEADER2 *video_format2;
++    BITMAPINFOHEADER *bitmap_header;
++    size_t format_size;
+     uint32_t frame_time;
+ 
+     if (format->u.video.format == WG_VIDEO_FORMAT_UNKNOWN)
+@@ -576,7 +580,10 @@
+         return false;
+     }
+ 
+-    if (!(video_format = CoTaskMemAlloc(sizeof(*video_format))))
++    format_size = video_info2 ? sizeof(VIDEOINFOHEADER2) : sizeof(*video_format);
++    if (video_info2 && format->u.video.format == WG_VIDEO_FORMAT_RGB16)
++        format_size += sizeof(DWORD) * 3;
++    if (!(video_format = CoTaskMemAlloc(format_size)))
+         return false;
+ 
+     mt->majortype = MEDIATYPE_Video;
+@@ -586,35 +593,55 @@
+     else
+         mt->bTemporalCompression = TRUE;
+     mt->lSampleSize = 1;
+-    mt->formattype = FORMAT_VideoInfo;
+-    mt->cbFormat = sizeof(VIDEOINFOHEADER);
++    mt->formattype = video_info2 ? FORMAT_VideoInfo2 : FORMAT_VideoInfo;
++    mt->cbFormat = video_info2 ? sizeof(VIDEOINFOHEADER2) : sizeof(VIDEOINFOHEADER);
+     mt->pbFormat = (BYTE *)video_format;
+ 
+-    memset(video_format, 0, sizeof(*video_format));
+-
+-    if (wm)
+-    {
+-        SetRect(&video_format->rcSource, 0, 0, format->u.video.width, abs(format->u.video.height));
+-        video_format->rcTarget = video_format->rcSource;
++    memset(video_format, 0, format_size);
++
++    video_format2 = (VIDEOINFOHEADER2 *)video_format;
++    bitmap_header = video_info2 ? &video_format2->bmiHeader : &video_format->bmiHeader;
++
++    if (wm || video_info2)
++    {
++        SetRect(&video_format2->rcSource, 0, 0, format->u.video.width, abs(format->u.video.height));
++        video_format2->rcTarget = video_format2->rcSource;
+     }
+     if ((frame_time = MulDiv(10000000, format->u.video.fps_d, format->u.video.fps_n)) != -1)
+-        video_format->AvgTimePerFrame = frame_time;
+-    video_format->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+-    video_format->bmiHeader.biWidth = format->u.video.width;
+-    video_format->bmiHeader.biHeight = format->u.video.height;
++        video_format2->AvgTimePerFrame = frame_time;
++    bitmap_header->biSize = sizeof(BITMAPINFOHEADER);
++    bitmap_header->biWidth = format->u.video.width;
++    bitmap_header->biHeight = format->u.video.height;
+     if (wg_video_format_is_rgb(format->u.video.format))
+-        video_format->bmiHeader.biHeight = -format->u.video.height;
+-    video_format->bmiHeader.biPlanes = 1;
+-    video_format->bmiHeader.biBitCount = wg_video_format_get_depth(format->u.video.format);
+-    video_format->bmiHeader.biCompression = wg_video_format_get_compression(format->u.video.format);
+-    video_format->bmiHeader.biSizeImage = wg_format_get_max_size(format);
++        bitmap_header->biHeight = -format->u.video.height;
++    bitmap_header->biPlanes = 1;
++    bitmap_header->biBitCount = wg_video_format_get_depth(format->u.video.format);
++    bitmap_header->biCompression = wg_video_format_get_compression(format->u.video.format);
++    bitmap_header->biSizeImage = wg_format_get_max_size(format);
++
++    if (video_info2)
++    {
++        video_format2->dwPictAspectRatioX = abs(bitmap_header->biWidth);
++        video_format2->dwPictAspectRatioY = abs(bitmap_header->biHeight);
++    }
+ 
+     if (format->u.video.format == WG_VIDEO_FORMAT_RGB16)
+     {
+-        mt->cbFormat = offsetof(VIDEOINFO, dwBitMasks[3]);
+-        video_format->dwBitMasks[iRED]   = 0xf800;
+-        video_format->dwBitMasks[iGREEN] = 0x07e0;
+-        video_format->dwBitMasks[iBLUE]  = 0x001f;
++        if (video_info2)
++        {
++            DWORD *masks = (DWORD *)(video_format2 + 1);
++            mt->cbFormat += sizeof(DWORD) * 3;
++            masks[iRED] = 0xf800;
++            masks[iGREEN] = 0x07e0;
++            masks[iBLUE] = 0x001f;
++        }
++        else
++        {
++            mt->cbFormat = offsetof(VIDEOINFO, dwBitMasks[3]);
++            video_format->dwBitMasks[iRED]   = 0xf800;
++            video_format->dwBitMasks[iGREEN] = 0x07e0;
++            video_format->dwBitMasks[iBLUE]  = 0x001f;
++        }
+     }
+ 
+     return true;
+@@ -800,7 +827,7 @@
+         return amt_from_wg_format_audio_wma(mt, format);
+ 
+     case WG_MAJOR_TYPE_VIDEO:
+-        return amt_from_wg_format_video(mt, format, wm);
++        return amt_from_wg_format_video(mt, format, wm, false);
+ 
+     case WG_MAJOR_TYPE_VIDEO_CINEPAK:
+         return amt_from_wg_format_video_cinepak(mt, format);
+@@ -1007,22 +1034,28 @@
+     };
+ 
+     const VIDEOINFOHEADER *video_format = (const VIDEOINFOHEADER *)mt->pbFormat;
++    const BITMAPINFOHEADER *bitmap_header;
+     unsigned int i;
+ 
+-    if (!IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
++    if (!IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo)
++            && !IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo2))
+     {
+         FIXME("Unknown format type %s.\n", debugstr_guid(&mt->formattype));
+         return false;
+     }
+-    if (mt->cbFormat < sizeof(VIDEOINFOHEADER) || !mt->pbFormat)
++    if (!mt->pbFormat || (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo)
++            ? mt->cbFormat < sizeof(VIDEOINFOHEADER) : mt->cbFormat < sizeof(VIDEOINFOHEADER2)))
+     {
+         ERR("Unexpected format size %lu.\n", mt->cbFormat);
+         return false;
+     }
+ 
++    bitmap_header = IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo)
++            ? &video_format->bmiHeader : &((const VIDEOINFOHEADER2 *)mt->pbFormat)->bmiHeader;
++
+     format->major_type = WG_MAJOR_TYPE_VIDEO;
+-    format->u.video.width = video_format->bmiHeader.biWidth;
+-    format->u.video.height = video_format->bmiHeader.biHeight;
++    format->u.video.width = bitmap_header->biWidth;
++    format->u.video.height = bitmap_header->biHeight;
+     format->u.video.fps_n = 10000000;
+     format->u.video.fps_d = video_format->AvgTimePerFrame;
+ 
+@@ -1858,13 +1891,23 @@
+         FreeMediaType(mt);
+     }
+ 
+-    if (format->major_type == WG_MAJOR_TYPE_VIDEO && index < ARRAY_SIZE(video_formats))
+-    {
++    if (format->major_type == WG_MAJOR_TYPE_VIDEO)
++    {
++        bool video_info2 = false;
++
++        if (index >= ARRAY_SIZE(video_formats))
++        {
++            index -= ARRAY_SIZE(video_formats);
++            video_info2 = true;
++        }
++        if (index >= ARRAY_SIZE(video_formats))
++            return VFW_S_NO_MORE_ITEMS;
++
+         format->u.video.format = video_formats[index];
+         /* Downstream filters probably expect RGB video to be bottom-up. */
+         if (format->u.video.height > 0 && wg_video_format_is_rgb(video_formats[index]))
+             format->u.video.height = -format->u.video.height;
+-        if (!amt_from_wg_format(mt, format, false))
++        if (!amt_from_wg_format_video(mt, format, false, video_info2))
+             return E_OUTOFMEMORY;
+         return S_OK;
+     }
+@@ -2324,9 +2367,18 @@
+     unsigned int buffer_size = 16384;
+     ALLOCATOR_PROPERTIES ret_props;
+ 
+-    if (IsEqualGUID(&pin->pin.pin.mt.formattype, &FORMAT_VideoInfo))
++    if (IsEqualGUID(&pin->pin.pin.mt.formattype, &FORMAT_VideoInfo)
++            && pin->pin.pin.mt.pbFormat
++            && pin->pin.pin.mt.cbFormat >= sizeof(VIDEOINFOHEADER))
+     {
+         VIDEOINFOHEADER *format = (VIDEOINFOHEADER *)pin->pin.pin.mt.pbFormat;
++        buffer_size = format->bmiHeader.biSizeImage;
++    }
++    else if (IsEqualGUID(&pin->pin.pin.mt.formattype, &FORMAT_VideoInfo2)
++            && pin->pin.pin.mt.pbFormat
++            && pin->pin.pin.mt.cbFormat >= sizeof(VIDEOINFOHEADER2))
++    {
++        VIDEOINFOHEADER2 *format = (VIDEOINFOHEADER2 *)pin->pin.pin.mt.pbFormat;
+         buffer_size = format->bmiHeader.biSizeImage;
+     }
+     else if (IsEqualGUID(&pin->pin.pin.mt.formattype, &FORMAT_MPEGVideo))
