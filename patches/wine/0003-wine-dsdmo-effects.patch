@@ -1,26 +1,36 @@
 diff --git a/dlls/dsdmo/Makefile.in b/dlls/dsdmo/Makefile.in
 --- a/dlls/dsdmo/Makefile.in
 +++ b/dlls/dsdmo/Makefile.in
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,7 @@
  MODULE    = dsdmo.dll
 -IMPORTS   = dmoguids strmiids uuid
 +IMPORTS   = $(FAUDIO_PE_LIBS) dmoguids strmiids uuid msdmo
 +EXTRAINCL = $(FAUDIO_PE_CFLAGS)
++main_EXTRADEFS = -ffp-contract=off
  
  EXTRADLLFLAGS = -Wb,--prefer-native
  
 diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 --- a/dlls/dsdmo/main.c
 +++ b/dlls/dsdmo/main.c
-@@ -27,9 +27,16 @@
+@@ -27,9 +27,25 @@
  #include "dsound.h"
  #include "rpcproxy.h"
  
 +#include <math.h>
 +#include <stdint.h>
 +
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++#include <immintrin.h>
++#endif
++
 +#include <FAPO.h>
 +#include <FAudioFX.h>
++
++#if defined(__x86_64__) && !defined(__arm64ec__) && defined(__FLT_EVAL_METHOD__) \
++        && __FLT_EVAL_METHOD__ == 0
++#define DSDMO_FLOAT32_REGISTERS
++#endif
 +
  #include "wine/debug.h"
  
@@ -29,7 +39,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
  struct effect
  {
-@@ -43,6 +50,8 @@
+@@ -43,6 +59,8 @@
  
      CRITICAL_SECTION cs;
      WAVEFORMATEX format;
@@ -38,7 +48,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
      const struct effect_ops *ops;
  };
-@@ -51,6 +60,12 @@
+@@ -51,6 +69,12 @@
  {
      void *(*query_interface)(struct effect *effect, REFIID iid);
      void (*destroy)(struct effect *effect);
@@ -51,7 +61,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  };
  
  static struct effect *impl_from_IUnknown(IUnknown *iface)
-@@ -102,6 +117,8 @@
+@@ -102,6 +126,8 @@
  
      if (!refcount)
      {
@@ -60,7 +70,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
          effect->cs.DebugInfo->Spare[0] = 0;
          DeleteCriticalSection(&effect->cs);
          effect->ops->destroy(effect);
-@@ -139,147 +156,282 @@
+@@ -139,147 +165,282 @@
      return IUnknown_Release(effect->outer_unk);
  }
  
@@ -425,7 +435,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI effect_GetInputMaxLatency(IMediaObject *iface, DWORD index, REFERENCE_TIME *latency)
-@@ -296,32 +448,69 @@
+@@ -296,32 +457,69 @@
  
  static HRESULT WINAPI effect_Flush(IMediaObject *iface)
  {
@@ -505,7 +515,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI effect_ProcessInput(IMediaObject *iface, DWORD index,
-@@ -341,8 +530,12 @@
+@@ -341,8 +539,12 @@
  
  static HRESULT WINAPI effect_Lock(IMediaObject *iface, LONG lock)
  {
@@ -520,7 +530,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const IMediaObjectVtbl effect_vtbl =
-@@ -399,32 +592,57 @@
+@@ -399,32 +601,57 @@
  static HRESULT WINAPI effect_inplace_Process(IMediaObjectInPlace *iface, ULONG size,
          BYTE *data, REFERENCE_TIME start, DWORD flags)
  {
@@ -597,7 +607,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const IMediaObjectInPlaceVtbl effect_inplace_vtbl =
-@@ -599,7 +817,14 @@
+@@ -599,7 +826,14 @@
      struct effect effect;
      IDirectSoundFXParamEq IDirectSoundFXParamEq_iface;
      DSFXParamEq params;
@@ -612,7 +622,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
  static struct eq *impl_from_IDirectSoundFXParamEq(IDirectSoundFXParamEq *iface)
  {
-@@ -627,13 +852,31 @@
+@@ -627,13 +861,31 @@
  static HRESULT WINAPI eq_params_SetAllParameters(IDirectSoundFXParamEq *iface, const DSFXParamEq *params)
  {
      struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
@@ -646,7 +656,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI eq_params_GetAllParameters(IDirectSoundFXParamEq *iface, DSFXParamEq *params)
-@@ -641,6 +884,9 @@
+@@ -641,6 +893,9 @@
      struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
  
      TRACE("effect %p, params %p.\n", effect, params);
@@ -656,7 +666,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
      EnterCriticalSection(&effect->effect.cs);
      *params = effect->params;
-@@ -682,6 +928,8 @@
+@@ -682,6 +937,8 @@
  {
      .destroy = eq_destroy,
      .query_interface = eq_query_interface,
@@ -665,7 +675,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  };
  
  static HRESULT eq_create(IUnknown *outer, IUnknown **out)
-@@ -703,12 +951,1529 @@
+@@ -703,12 +960,1674 @@
      return S_OK;
  }
  
@@ -682,19 +692,19 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +struct i3dl2_stage_state
 +{
 +    float *q;
-+    size_t capacity, delay;
++    size_t capacity, delay, index;
 +    float p, c, b, g;
 +};
 +
 +struct i3dl2_state
 +{
 +    float *filtered[2];
-+    size_t filtered_length;
++    size_t filtered_length, filtered_index;
 +    size_t early_delay[2][5], late_delay[2];
 +    struct i3dl2_stage_state early_ap[2];
 +    struct i3dl2_stage_state stage[2][6];
 +    float *long_q[2];
-+    size_t long_length, long_delay;
++    size_t long_length, long_delay, long_index;
 +    float long_p[2], long_c, long_b;
 +    float feedback[2], filtered_previous[2];
 +    float early_gain, late_gain[2], pole;
@@ -709,34 +719,48 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +#define I3DL2_MAX_DELAY 1048576
 +#define I3DL2_PI 3.14159265358979323846
 +
++static void i3dl2_reset_indices(struct i3dl2_state *state)
++{
++    unsigned int side, stage;
++
++    state->filtered_index = state->long_index = 0;
++    for (side = 0; side < 2; ++side)
++    {
++        state->early_ap[side].index = 0;
++        for (stage = 0; stage < 6; ++stage)
++            state->stage[side][stage].index = 0;
++    }
++}
++
++/* Scalar SSE rounds without a store; retain explicit narrowing for excess precision. */
 +static float i3dl2_r32(float value)
 +{
++#ifdef DSDMO_FLOAT32_REGISTERS
++    return value;
++#else
 +    volatile float rounded = value;
 +    return rounded;
++#endif
 +}
 +
 +static float i3dl2_fadd(float left, float right)
 +{
-+    volatile float result = left + right;
-+    return result;
++    return i3dl2_r32(left + right);
 +}
 +
 +static float i3dl2_fsub(float left, float right)
 +{
-+    volatile float result = left - right;
-+    return result;
++    return i3dl2_r32(left - right);
 +}
 +
 +static float i3dl2_fmul(float left, float right)
 +{
-+    volatile float result = left * right;
-+    return result;
++    return i3dl2_r32(left * right);
 +}
 +
 +static float i3dl2_fdiv(float left, float right)
 +{
-+    volatile float result = left / right;
-+    return result;
++    return i3dl2_r32(left / right);
 +}
 +
 +static float i3dl2_pow10(float value)
@@ -751,12 +775,9 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    return (size_t)truncf(value);
 +}
 +
-+static size_t i3dl2_ring_index(uint64_t position, size_t delay, size_t length)
++static size_t i3dl2_ring_index(size_t current, size_t delay, size_t length)
 +{
-+    size_t current = (size_t)(position % length);
-+    size_t offset = delay % length;
-+
-+    return current >= offset ? current - offset : length - offset + current;
++    return current >= delay ? current - delay : length - delay + current;
 +}
 +
 +static float i3dl2_stage_energy(const struct i3dl2_stage_state *stage)
@@ -847,6 +868,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    memset(state->half_previous, 0, sizeof(state->half_previous));
 +    state->position = 0;
 +    state->frame_position = 0;
++    i3dl2_reset_indices(state);
 +}
 +
 +static BOOL i3dl2_supported(const WAVEFORMATEX *format, LONG quality)
@@ -1060,30 +1082,31 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    return hr;
 +}
 +
-+static float i3dl2_stage_process(struct i3dl2_stage_state *stage,
-+        float input, uint64_t position)
++static float i3dl2_stage_process(struct i3dl2_stage_state *stage, float input)
 +{
-+    float delayed = stage->q[i3dl2_ring_index(position, stage->delay, stage->capacity)];
++    size_t current = stage->index;
++    float delayed = stage->q[i3dl2_ring_index(current, stage->delay, stage->capacity)];
 +    float value = i3dl2_fmul(stage->b, i3dl2_fsub(stage->p, delayed));
 +    float output;
 +
 +    stage->p = i3dl2_fadd(delayed, value);
 +    output = i3dl2_fadd(i3dl2_fmul(stage->g, input), i3dl2_fmul(stage->c, stage->p));
-+    stage->q[(size_t)(position % stage->capacity)] = i3dl2_fsub(input,
++    stage->q[current] = i3dl2_fsub(input,
 +            i3dl2_fmul(stage->g, output));
++    stage->index = current + 1 == stage->capacity ? 0 : current + 1;
 +    return output;
 +}
 +
 +static float i3dl2_long_process(struct i3dl2_state *state,
-+        unsigned int side, float input, uint64_t position)
++        unsigned int side, float input, size_t current)
 +{
-+    float delayed = state->long_q[side][i3dl2_ring_index(position,
++    float delayed = state->long_q[side][i3dl2_ring_index(current,
 +            state->long_delay, state->long_length)];
 +    float value = i3dl2_fmul(state->long_c, delayed);
 +
 +    state->long_p[side] = i3dl2_fadd(value,
 +            i3dl2_fmul(state->long_b, i3dl2_fsub(state->long_p[side], value)));
-+    state->long_q[side][(size_t)(position % state->long_length)] = input;
++    state->long_q[side][current] = input;
 +    return state->long_p[side];
 +}
 +
@@ -1119,12 +1142,21 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    struct waves_reverb_coefficients coeff;
 +};
 +
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++typedef void (*waves_integer_network_func)(const int32_t *b, const int32_t *previous,
++        const int32_t *injection, const int32_t *b_coeff, const int32_t *e_coeff,
++        const int32_t *allpass, int32_t k, int32_t *u, int32_t *v, int32_t *q);
++#endif
++
 +struct waves_reverb
 +{
 +    struct effect effect;
 +    IDirectSoundFXWavesReverb IDirectSoundFXWavesReverb_iface;
 +    DSFXWavesReverb params;
 +    struct waves_reverb_state state;
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++    waves_integer_network_func integer_network;
++#endif
 +};
 +
 +/* shortcut: native high-rate capacity folding is unverified; reject oversized histories until captured. */
@@ -1132,38 +1164,37 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +
 +static float waves_r32(float value)
 +{
++#ifdef DSDMO_FLOAT32_REGISTERS
++    return value;
++#else
 +    volatile float rounded = value;
 +    return rounded;
++#endif
 +}
 +
 +static float waves_fadd(float left, float right)
 +{
-+    volatile float result = left + right;
-+    return result;
++    return waves_r32(left + right);
 +}
 +
 +static float waves_fsub(float left, float right)
 +{
-+    volatile float result = left - right;
-+    return result;
++    return waves_r32(left - right);
 +}
 +
 +static float waves_fmul(float left, float right)
 +{
-+    volatile float result = left * right;
-+    return result;
++    return waves_r32(left * right);
 +}
 +
 +static float waves_fdiv(float left, float right)
 +{
-+    volatile float result = left / right;
-+    return result;
++    return waves_r32(left / right);
 +}
 +
 +static float waves_fneg(float value)
 +{
-+    volatile float result = -value;
-+    return result;
++    return waves_r32(-value);
 +}
 +
 +static float waves_pow10(float value)
@@ -1293,6 +1324,105 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    return waves_floor_q15(waves_s32((int64_t)a * b + (int64_t)c * d));
 +}
 +
++static inline void __attribute__((always_inline)) waves_integer_network_scalar(const int32_t *b, const int32_t *previous,
++        const int32_t *injection, const int32_t *b_coeff, const int32_t *e_coeff,
++        const int32_t *allpass, int32_t k, int32_t *u, int32_t *v, int32_t *q)
++{
++    unsigned int i, j;
++
++    for (j = 0; j < 2; ++j)
++    {
++        i = 2 * j;
++        u[i] = waves_p2(k, b[i + 1], allpass[j], v[i]);
++        u[i + 1] = waves_p2(allpass[j], v[i + 1], -k, b[i]);
++        v[i] = waves_s32((int64_t)b[i] + waves_p(k, u[i + 1]));
++        v[i + 1] = waves_s32((int64_t)b[i + 1] - waves_p(k, u[i]));
++    }
++    for (i = 0; i < 4; ++i)
++        q[i] = waves_s32((int64_t)waves_p2(b_coeff[i], u[i], e_coeff[i], previous[i]) + injection[i]);
++}
++
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++static void __attribute__((target("sse4.1"))) waves_integer_network_sse41(
++        const int32_t *b, const int32_t *previous, const int32_t *injection,
++        const int32_t *b_coeff, const int32_t *e_coeff, const int32_t *allpass,
++        int32_t k, int32_t *u, int32_t *v, int32_t *q)
++{
++    /* Q15 products wrap to 32 bits before the arithmetic shift. */
++    const __m128i k_vec = _mm_set1_epi32(k);
++    const __m128i b_vec = _mm_loadu_si128((const __m128i *)b);
++    const __m128i v_vec = _mm_loadu_si128((const __m128i *)v);
++    const __m128i b_swap = _mm_shuffle_epi32(b_vec, _MM_SHUFFLE(2, 3, 0, 1));
++    const __m128i allpass_vec = _mm_setr_epi32(allpass[0], allpass[0], allpass[1], allpass[1]);
++    const __m128i kb_vec = _mm_mullo_epi32(k_vec, b_swap);
++    const __m128i allpass_v_vec = _mm_mullo_epi32(allpass_vec, v_vec);
++    const __m128i u_even = _mm_srai_epi32(_mm_add_epi32(
++            kb_vec, allpass_v_vec), 15);
++    const __m128i u_odd = _mm_srai_epi32(_mm_sub_epi32(allpass_v_vec, kb_vec), 15);
++    const __m128i u_vec = _mm_blend_epi16(u_even, u_odd, 0xcc);
++    const __m128i u_swap = _mm_shuffle_epi32(u_vec, _MM_SHUFFLE(2, 3, 0, 1));
++    const __m128i pku_vec = _mm_srai_epi32(_mm_mullo_epi32(k_vec, u_swap), 15);
++    const __m128i v_vec_out = _mm_blend_epi16(_mm_add_epi32(b_vec, pku_vec),
++            _mm_sub_epi32(b_vec, pku_vec), 0xcc);
++    const __m128i b_coeff_vec = _mm_loadu_si128((const __m128i *)b_coeff);
++    const __m128i e_coeff_vec = _mm_loadu_si128((const __m128i *)e_coeff);
++    const __m128i previous_vec = _mm_loadu_si128((const __m128i *)previous);
++    const __m128i injection_vec = _mm_loadu_si128((const __m128i *)injection);
++    const __m128i p2_vec = _mm_srai_epi32(_mm_add_epi32(
++            _mm_mullo_epi32(b_coeff_vec, u_vec), _mm_mullo_epi32(e_coeff_vec, previous_vec)), 15);
++    const __m128i q_vec = _mm_add_epi32(p2_vec, injection_vec);
++
++    _mm_storeu_si128((__m128i *)u, u_vec);
++    _mm_storeu_si128((__m128i *)v, v_vec_out);
++    _mm_storeu_si128((__m128i *)q, q_vec);
++}
++
++static void __attribute__((target("avx2"))) waves_integer_network_avx2(
++        const int32_t *b, const int32_t *previous, const int32_t *injection,
++        const int32_t *b_coeff, const int32_t *e_coeff, const int32_t *allpass,
++        int32_t k, int32_t *u, int32_t *v, int32_t *q)
++{
++    /* Each 256-bit multiply carries two groups of four Q15 products. */
++    const __m128i k_vec = _mm_set1_epi32(k);
++    const __m128i b_vec = _mm_loadu_si128((const __m128i *)b);
++    const __m128i v_vec = _mm_loadu_si128((const __m128i *)v);
++    const __m128i b_swap = _mm_shuffle_epi32(b_vec, _MM_SHUFFLE(2, 3, 0, 1));
++    const __m128i allpass_vec = _mm_setr_epi32(allpass[0], allpass[0], allpass[1], allpass[1]);
++    const __m256i u_products = _mm256_mullo_epi32(
++            _mm256_set_m128i(allpass_vec, k_vec),
++            _mm256_set_m128i(v_vec, b_swap));
++    const __m256i u_products_swap = _mm256_permute2x128_si256(
++            u_products, u_products, 0x01);
++    const __m128i u_even = _mm_srai_epi32(_mm256_castsi256_si128(
++            _mm256_add_epi32(u_products, u_products_swap)), 15);
++    const __m128i u_odd = _mm_srai_epi32(_mm256_castsi256_si128(
++            _mm256_sub_epi32(u_products_swap, u_products)), 15);
++    const __m128i u_vec = _mm_blend_epi16(u_even, u_odd, 0xcc);
++    const __m128i u_swap = _mm_shuffle_epi32(u_vec, _MM_SHUFFLE(2, 3, 0, 1));
++    const __m128i pku_vec = _mm_srai_epi32(_mm_mullo_epi32(k_vec, u_swap), 15);
++    const __m128i v_vec_out = _mm_blend_epi16(_mm_add_epi32(b_vec, pku_vec),
++            _mm_sub_epi32(b_vec, pku_vec), 0xcc);
++    const __m128i b_coeff_vec = _mm_loadu_si128((const __m128i *)b_coeff);
++    const __m128i e_coeff_vec = _mm_loadu_si128((const __m128i *)e_coeff);
++    const __m128i previous_vec = _mm_loadu_si128((const __m128i *)previous);
++    const __m128i injection_vec = _mm_loadu_si128((const __m128i *)injection);
++    const __m256i q_products = _mm256_mullo_epi32(
++            _mm256_set_m128i(e_coeff_vec, b_coeff_vec),
++            _mm256_set_m128i(previous_vec, u_vec));
++    const __m256i q_products_swap = _mm256_permute2x128_si256(
++            q_products, q_products, 0x01);
++    const __m128i p2_vec = _mm_srai_epi32(_mm256_castsi256_si128(
++            _mm256_add_epi32(q_products, q_products_swap)), 15);
++    const __m128i q_vec = _mm_add_epi32(p2_vec, injection_vec);
++
++    _mm_storeu_si128((__m128i *)u, u_vec);
++    _mm_storeu_si128((__m128i *)v, v_vec_out);
++    _mm_storeu_si128((__m128i *)q, q_vec);
++}
++
++
++#endif
++
 +static int32_t waves_q15(float value)
 +{
 +    float scaled = waves_fadd(waves_fmul(value, 32768.0f), 0.5f);
@@ -1304,12 +1434,10 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    return (int32_t)truncf(scaled);
 +}
 +
-+static size_t waves_delay_index(uint64_t position, size_t delay, size_t length)
++static size_t waves_delay_index(size_t current, size_t length)
 +{
-+    size_t current = (size_t)(position % length);
-+    size_t offset = delay % length;
-+
-+    return current >= offset ? current - offset : length - offset + current;
++    /* Prepared delays are always one less than their history length. */
++    return current + 1 < length ? current + 1 : 0;
 +}
 +
 +static void waves_state_release(struct waves_reverb_state *state)
@@ -1356,17 +1484,16 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    BOOL integer = format->wFormatTag == WAVE_FORMAT_PCM;
 +    unsigned int i, j;
 +
++    if (state->prepared && state->rate == format->nSamplesPerSec
++            && state->channels == format->nChannels && state->format == format->wFormatTag
++            && state->depth == format->wBitsPerSample)
++        return S_OK;
 +    if (!waves_configure_delays(format->nSamplesPerSec, delay, allpass))
 +        return DMO_E_TYPE_NOT_ACCEPTED;
 +    for (i = 0; i < 4; ++i)
 +        delay[i] -= allpass[i / 2];
 +    if (format->wBitsPerSample != 16 && format->wBitsPerSample != 32)
 +        return DMO_E_TYPE_NOT_ACCEPTED;
-+    if (state->prepared && state->rate == format->nSamplesPerSec
-+            && state->channels == format->nChannels && state->format == format->wFormatTag
-+            && state->depth == format->wBitsPerSample)
-+        return S_OK;
-+
 +    for (i = 0; i < 4; ++i)
 +    {
 +        q_length[i] = delay[i] + 1;
@@ -1481,12 +1608,29 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    }
 +}
 +
-+static void write_truncated_sample(BYTE *data, WORD format, WORD depth, float sample)
++static inline void write_truncated_sample(BYTE *data, WORD format, WORD depth, float sample)
 +{
 +    if (format == WAVE_FORMAT_PCM)
 +    {
 +        float scale = depth == 8 ? 128.0f : 32768.0f;
 +
++#ifdef DSDMO_FLOAT32_REGISTERS
++        if (depth == 16 && isfinite(sample))
++        {
++            SHORT value;
++
++            /* Integer conversion already truncates; avoid the floating packing round trip. */
++            sample *= 32768.0f;
++            if (sample <= -32768.0f)
++                value = -32768;
++            else if (sample >= 32767.0f)
++                value = 32767;
++            else
++                value = (SHORT)sample;
++            memcpy(data, &value, sizeof(value));
++            return;
++        }
++#endif
 +        /* Truncate before the shared round-to-nearest packing helper. */
 +        sample = truncf(sample * scale) / scale;
 +    }
@@ -1777,8 +1921,12 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +
 +static float eq_r32(float value)
 +{
++#ifdef DSDMO_FLOAT32_REGISTERS
++    return value;
++#else
 +    volatile float rounded = value;
 +    return rounded;
++#endif
 +}
 +
 +static float eq_add(float left, float right)
@@ -1984,13 +2132,15 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    float a, b, u, v, z_left, z_right, sum;
 +    float a0, a1, a2, a3, a4, a5, b0, b1, b2, b3, b4, b5;
 +    uint64_t position = state->position;
++    size_t filtered_index = state->filtered_index;
++    size_t long_index = state->long_index;
 +    unsigned int side, tap;
 +
 +    for (side = 0; side < 2; ++side)
 +    {
 +        filtered[side] = i3dl2_fadd(input[side],
 +                i3dl2_fmul(i3dl2_fsub(state->filtered_previous[side], input[side]), state->pole));
-+        state->filtered[side][(size_t)(position % state->filtered_length)] = filtered[side];
++        state->filtered[side][filtered_index] = filtered[side];
 +        state->filtered_previous[side] = filtered[side];
 +    }
 +    for (side = 0; side < 2; ++side)
@@ -2000,12 +2150,12 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +        sum = 0.0f;
 +        for (tap = 0; tap < 5; ++tap)
 +            sum = i3dl2_fadd(sum, i3dl2_fmul(weights[tap],
-+                    state->filtered[side][i3dl2_ring_index(position,
++                    state->filtered[side][i3dl2_ring_index(filtered_index,
 +                    state->early_delay[side][tap], state->filtered_length)]));
 +        if (state->quality == 1 || state->quality == 3)
-+            sum = i3dl2_stage_process(&state->early_ap[side], sum, position);
++            sum = i3dl2_stage_process(&state->early_ap[side], sum);
 +        early[side] = i3dl2_fmul(sum, state->early_gain);
-+        late[side] = state->filtered[side][i3dl2_ring_index(position,
++        late[side] = state->filtered[side][i3dl2_ring_index(filtered_index,
 +                state->late_delay[side], state->filtered_length)];
 +    }
 +
@@ -2013,36 +2163,36 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    b = i3dl2_fadd(late[1], state->feedback[1]);
 +    u = i3dl2_fadd(i3dl2_fmul(-0.707f, a), i3dl2_fmul(0.707f, b));
 +    v = i3dl2_fsub(i3dl2_fmul(-0.707f, a), i3dl2_fmul(0.707f, b));
-+    a0 = i3dl2_stage_process(&state->stage[0][0], u, position);
-+    a1 = i3dl2_stage_process(&state->stage[0][1], a0, position);
++    a0 = i3dl2_stage_process(&state->stage[0][0], u);
++    a1 = i3dl2_stage_process(&state->stage[0][1], a0);
 +    if (state->quality == 1 || state->quality == 3)
 +    {
-+        a2 = i3dl2_stage_process(&state->stage[0][2], a1, position);
-+        a3 = i3dl2_stage_process(&state->stage[0][3], a2, position);
-+        a = i3dl2_long_process(state, 0, a3, position);
++        a2 = i3dl2_stage_process(&state->stage[0][2], a1);
++        a3 = i3dl2_stage_process(&state->stage[0][3], a2);
++        a = i3dl2_long_process(state, 0, a3, long_index);
 +    }
 +    else
 +    {
 +        a2 = a3 = 0.0f;
-+        a = i3dl2_long_process(state, 0, a1, position);
++        a = i3dl2_long_process(state, 0, a1, long_index);
 +    }
-+    a4 = i3dl2_stage_process(&state->stage[0][4], a, position);
-+    a5 = i3dl2_stage_process(&state->stage[0][5], a4, position);
-+    b0 = i3dl2_stage_process(&state->stage[1][0], v, position);
-+    b1 = i3dl2_stage_process(&state->stage[1][1], b0, position);
++    a4 = i3dl2_stage_process(&state->stage[0][4], a);
++    a5 = i3dl2_stage_process(&state->stage[0][5], a4);
++    b0 = i3dl2_stage_process(&state->stage[1][0], v);
++    b1 = i3dl2_stage_process(&state->stage[1][1], b0);
 +    if (state->quality == 1 || state->quality == 3)
 +    {
-+        b2 = i3dl2_stage_process(&state->stage[1][2], b1, position);
-+        b3 = i3dl2_stage_process(&state->stage[1][3], b2, position);
-+        b = i3dl2_long_process(state, 1, b3, position);
++        b2 = i3dl2_stage_process(&state->stage[1][2], b1);
++        b3 = i3dl2_stage_process(&state->stage[1][3], b2);
++        b = i3dl2_long_process(state, 1, b3, long_index);
 +    }
 +    else
 +    {
 +        b2 = b3 = 0.0f;
-+        b = i3dl2_long_process(state, 1, b1, position);
++        b = i3dl2_long_process(state, 1, b1, long_index);
 +    }
-+    b4 = i3dl2_stage_process(&state->stage[1][4], b, position);
-+    b5 = i3dl2_stage_process(&state->stage[1][5], b4, position);
++    b4 = i3dl2_stage_process(&state->stage[1][4], b);
++    b5 = i3dl2_stage_process(&state->stage[1][5], b4);
 +    state->feedback[0] = a5;
 +    state->feedback[1] = b5;
 +
@@ -2061,7 +2211,12 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    z_right = i3dl2_fadd(z_right, i3dl2_fmul(-0.38f, b5));
 +    output[0] = i3dl2_fadd(i3dl2_fmul(z_left, state->late_gain[0]), early[0]);
 +    output[1] = i3dl2_fadd(i3dl2_fmul(z_right, state->late_gain[1]), early[1]);
++    state->filtered_index = filtered_index + 1 == state->filtered_length ? 0 : filtered_index + 1;
++    state->long_index = long_index + 1 == state->long_length ? 0 : long_index + 1;
 +    state->position = position + 1;
++    /* Keep cached indices in sync when the original uint64 clock wraps. */
++    if (!state->position)
++        i3dl2_reset_indices(state);
 +}
 +
 +static HRESULT i3dl2_process_audio(struct reverb *effect, ULONG size,
@@ -2195,7 +2350,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
  static struct reverb *impl_from_IDirectSoundFXI3DL2Reverb(IDirectSoundFXI3DL2Reverb *iface)
  {
-@@ -733,23 +2498,74 @@
+@@ -733,23 +2652,74 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -2275,7 +2430,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  
      EnterCriticalSection(&effect->effect.cs);
      *params = effect->params;
-@@ -757,40 +2573,110 @@
+@@ -757,40 +2727,110 @@
      return S_OK;
  }
  
@@ -2400,7 +2555,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const IDirectSoundFXI3DL2ReverbVtbl reverb_params_vtbl =
-@@ -824,6 +2710,8 @@
+@@ -824,6 +2864,8 @@
  {
      struct reverb *effect = impl_reverb_from_effect(iface);
  
@@ -2409,7 +2564,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -831,6 +2719,9 @@
+@@ -831,6 +2873,9 @@
  {
      .destroy = reverb_destroy,
      .query_interface = reverb_query_interface,
@@ -2419,7 +2574,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  };
  
  static HRESULT reverb_create(IUnknown *outer, IUnknown **out)
-@@ -843,36 +2734,268 @@
+@@ -843,36 +2888,410 @@
      effect_init(&object->effect, outer, &reverb_ops);
      object->IDirectSoundFXI3DL2Reverb_iface.lpVtbl = &reverb_params_vtbl;
  
@@ -2491,11 +2646,16 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    const WAVEFORMATEX *format = &effect->effect.format;
 +    DWORD frame_count = size / format->nBlockAlign;
 +    unsigned int frame, i, j;
++    size_t q_index[4], v_index[2];
 +    float previous[4], b[4], u[4], v[4], q[4], injection[4];
 +    float input_left, input_right, dry_left, dry_right, output_left, output_right;
 +    BYTE *frame_data;
 +
 +    memcpy(previous, state->float_previous, sizeof(previous));
++    for (i = 0; i < 4; ++i)
++        q_index[i] = state->position % state->q_length[i];
++    for (j = 0; j < 2; ++j)
++        v_index[j] = state->position % state->v_length[2 * j];
 +    for (frame = 0; frame < frame_count; ++frame)
 +    {
 +        uint64_t position = state->position;
@@ -2525,13 +2685,17 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +        }
 +
 +        for (i = 0; i < 4; ++i)
-+            b[i] = state->float_q[i][waves_delay_index(position, state->delay[i], state->q_length[i])];
++        {
++            b[i] = state->float_q[i][waves_delay_index(q_index[i], state->q_length[i])];
++        }
 +        for (j = 0; j < 2; ++j)
 +        {
++            size_t delayed;
++
 +            i = 2 * j;
-+            v[i] = state->float_v[i][waves_delay_index(position, state->allpass[j], state->v_length[i])];
-+            v[i + 1] = state->float_v[i + 1][waves_delay_index(position, state->allpass[j],
-+                    state->v_length[i + 1])];
++            delayed = waves_delay_index(v_index[j], state->v_length[i]);
++            v[i] = state->float_v[i][delayed];
++            v[i + 1] = state->float_v[i + 1][delayed];
 +            u[i] = waves_fadd(waves_fmul(0.618034f, b[i + 1]),
 +                    waves_fmul(coeff->allpass[j], v[i]));
 +            u[i + 1] = waves_fsub(waves_fmul(coeff->allpass[j], v[i + 1]),
@@ -2545,11 +2709,20 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +
 +        for (i = 0; i < 4; ++i)
 +        {
-+            state->float_q[i][(size_t)(position % state->q_length[i])] = q[i];
-+            state->float_v[i][(size_t)(position % state->v_length[i])] = v[i];
++            state->float_q[i][q_index[i]] = q[i];
++            state->float_v[i][v_index[i / 2]] = v[i];
 +        }
 +        memcpy(previous, u, sizeof(previous));
 +        state->position = position + 1;
++        for (i = 0; i < 4; ++i)
++            q_index[i] = q_index[i] + 1 == state->q_length[i] ? 0 : q_index[i] + 1;
++        for (j = 0; j < 2; ++j)
++            v_index[j] = v_index[j] + 1 == state->v_length[2 * j] ? 0 : v_index[j] + 1;
++        if (!state->position)
++        {
++            memset(q_index, 0, sizeof(q_index));
++            memset(v_index, 0, sizeof(v_index));
++        }
 +
 +        output_left = waves_fadd(dry_left, waves_fadd(u[0], u[2]));
 +        output_right = waves_fadd(dry_right, waves_fadd(u[1], u[3]));
@@ -2575,7 +2748,11 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    int32_t b_coeff[4], e_coeff[4], allpass[2], dry_coeff, wet_coeff, k;
 +    DWORD frame_count = size / format->nBlockAlign;
 +    unsigned int frame, i, j;
++    size_t q_index[4], v_index[2];
 +    BYTE *frame_data;
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++    waves_integer_network_func network = effect->integer_network;
++#endif
 +
 +    for (i = 0; i < 4; ++i)
 +    {
@@ -2588,6 +2765,10 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    wet_coeff = waves_q15(coeff->wet);
 +    k = waves_q15(0.618034f);
 +    memcpy(previous, state->int_previous, sizeof(previous));
++    for (i = 0; i < 4; ++i)
++        q_index[i] = state->position % state->q_length[i];
++    for (j = 0; j < 2; ++j)
++        v_index[j] = state->position % state->v_length[2 * j];
 +
 +    for (frame = 0; frame < frame_count; ++frame)
 +    {
@@ -2629,29 +2810,45 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +        }
 +
 +        for (i = 0; i < 4; ++i)
-+            b[i] = state->int_q[i][waves_delay_index(position, state->delay[i], state->q_length[i])];
++        {
++            b[i] = state->int_q[i][waves_delay_index(q_index[i], state->q_length[i])];
++        }
 +        for (j = 0; j < 2; ++j)
 +        {
++            size_t delayed;
++
 +            i = 2 * j;
-+            v[i] = state->int_v[i][waves_delay_index(position, state->allpass[j], state->v_length[i])];
-+            v[i + 1] = state->int_v[i + 1][waves_delay_index(position, state->allpass[j],
-+                    state->v_length[i + 1])];
-+            u[i] = waves_p2(k, b[i + 1], allpass[j], v[i]);
-+            u[i + 1] = waves_p2(allpass[j], v[i + 1], -k, b[i]);
-+            v[i] = waves_s32((int64_t)b[i] + waves_p(k, u[i + 1]));
-+            v[i + 1] = waves_s32((int64_t)b[i + 1] - waves_p(k, u[i]));
++            delayed = waves_delay_index(v_index[j], state->v_length[i]);
++            v[i] = state->int_v[i][delayed];
++            v[i + 1] = state->int_v[i + 1][delayed];
 +        }
-+        for (i = 0; i < 4; ++i)
-+            q[i] = waves_s32((int64_t)waves_p2(b_coeff[i], u[i], e_coeff[i], previous[i])
-+                    + injection[i]);
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++        if (network == waves_integer_network_avx2)
++            waves_integer_network_avx2(b, previous, injection, b_coeff, e_coeff, allpass, k, u, v, q);
++        else if (network == waves_integer_network_sse41)
++            waves_integer_network_sse41(b, previous, injection, b_coeff, e_coeff, allpass, k, u, v, q);
++        else
++            waves_integer_network_scalar(b, previous, injection, b_coeff, e_coeff, allpass, k, u, v, q);
++#else
++        waves_integer_network_scalar(b, previous, injection, b_coeff, e_coeff, allpass, k, u, v, q);
++#endif
 +
 +        for (i = 0; i < 4; ++i)
 +        {
-+            state->int_q[i][(size_t)(position % state->q_length[i])] = q[i];
-+            state->int_v[i][(size_t)(position % state->v_length[i])] = v[i];
++            state->int_q[i][q_index[i]] = q[i];
++            state->int_v[i][v_index[i / 2]] = v[i];
 +        }
 +        memcpy(previous, u, sizeof(previous));
 +        state->position = position + 1;
++        for (i = 0; i < 4; ++i)
++            q_index[i] = q_index[i] + 1 == state->q_length[i] ? 0 : q_index[i] + 1;
++        for (j = 0; j < 2; ++j)
++            v_index[j] = v_index[j] + 1 == state->v_length[2 * j] ? 0 : v_index[j] + 1;
++        if (!state->position)
++        {
++            memset(q_index, 0, sizeof(q_index));
++            memset(v_index, 0, sizeof(v_index));
++        }
 +
 +        output_left = waves_s32((int64_t)dry_left + waves_s32((int64_t)u[0] + u[2]));
 +        output_right = waves_s32((int64_t)dry_right + waves_s32((int64_t)u[1] + u[3]));
@@ -2688,6 +2885,106 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    return waves_reverb_process_float(effect, size, data, flags, coeff);
 +}
 +
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++static ULONGLONG waves_integer_network_time(struct waves_reverb *probe, waves_integer_network_func network,
++        const SHORT input[1024])
++{
++    SHORT buffer[1024];
++    LARGE_INTEGER start, end;
++    unsigned int i;
++
++    waves_state_reset(&probe->state);
++    probe->state.params_dirty = FALSE;
++    probe->integer_network = network;
++    for (i = 0; i < 4; ++i)
++    {
++        memcpy(buffer, input, sizeof(buffer));
++        if (FAILED(waves_reverb_process(&probe->effect, sizeof(buffer), (BYTE *)buffer, DMO_INPLACE_NORMAL)))
++            return UINT64_MAX;
++    }
++    /* Expose the private state to keep timed work between the counter reads. */
++    __asm__ __volatile__("" : : "r"(probe) : "memory");
++    if (!QueryPerformanceCounter(&start))
++        return UINT64_MAX;
++    for (i = 0; i < 8; ++i)
++    {
++        memcpy(buffer, input, sizeof(buffer));
++        if (FAILED(waves_reverb_process(&probe->effect, sizeof(buffer), (BYTE *)buffer, DMO_INPLACE_NORMAL)))
++            return UINT64_MAX;
++    }
++    __asm__ __volatile__("" : : "r"(probe) : "memory");
++    if (!QueryPerformanceCounter(&end) || end.QuadPart <= start.QuadPart)
++        return UINT64_MAX;
++    return end.QuadPart - start.QuadPart;
++}
++
++static waves_integer_network_func waves_select_integer_network(void)
++{
++    waves_integer_network_func candidates[3] = {waves_integer_network_scalar, waves_integer_network_sse41};
++    static const char *const names[] = {"scalar", "sse4.1", "avx2"};
++    const WAVEFORMATEX format = {WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0};
++    const DWORD64 avx_state = XSTATE_MASK_LEGACY_SSE | XSTATE_MASK_GSSE;
++    ULONGLONG costs[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX}, cost;
++    struct waves_reverb probe = {0};
++    SHORT input[1024];
++    uint32_t noise = 0x12345678;
++    unsigned int count = 2, best = 1, round, step, i;
++
++    if (!IsProcessorFeaturePresent(PF_SSE4_1_INSTRUCTIONS_AVAILABLE))
++        return waves_integer_network_scalar;
++    if (IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)
++            && IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE)
++            && IsProcessorFeaturePresent(PF_XSAVE_ENABLED)
++            && (GetEnabledXStateFeatures() & avx_state) == avx_state)
++        candidates[count++] = waves_integer_network_avx2;
++
++    probe.effect.format = format;
++    probe.effect.output_type_set = TRUE;
++    probe.params.fInGain = DSFX_WAVESREVERB_INGAIN_DEFAULT;
++    probe.params.fReverbMix = DSFX_WAVESREVERB_REVERBMIX_DEFAULT;
++    probe.params.fReverbTime = DSFX_WAVESREVERB_REVERBTIME_DEFAULT;
++    probe.params.fHighFreqRTRatio = DSFX_WAVESREVERB_HIGHFREQRTRATIO_DEFAULT;
++    if (FAILED(waves_state_prepare(&probe.state, &format)))
++        return waves_integer_network_sse41;
++    if (FAILED(waves_make_coefficients(&probe.params, format.nSamplesPerSec,
++            probe.state.delay, probe.state.allpass, &probe.state.coeff)))
++    {
++        waves_state_release(&probe.state);
++        return waves_integer_network_sse41;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(input); ++i)
++    {
++        double phase = (i / 2) * (6.28318530717958647692 / 48000.0);
++        double frequency = (i & 1) ? 330.0 : 220.0;
++        double sample;
++
++        noise = noise * 1664525u + 1013904223u;
++        sample = 0.42 * sin(frequency * phase) + 0.18 * sin(2.0 * frequency * phase + 0.2)
++                + 0.025 * ((noise >> 16) / 32768.0 - 1.0);
++        input[i] = sample * 32767.0;
++    }
++
++    /* Rotate order and keep each minimum to reject scheduler interruptions. */
++    for (round = 0; round < 3; ++round)
++        for (step = 0; step < count; ++step)
++        {
++            i = (round + step) % count;
++            cost = waves_integer_network_time(&probe, candidates[i], input);
++            if (cost < costs[i])
++                costs[i] = cost;
++        }
++    waves_state_release(&probe.state);
++    for (i = 0; i < count; ++i)
++        if (costs[i] < costs[best])
++            best = i;
++    TRACE("Waves integer network %s selected, calibration ticks scalar %llu, sse4.1 %llu, avx2 %llu.\n",
++            names[best], (unsigned long long)costs[0], (unsigned long long)costs[1],
++            (unsigned long long)costs[2]);
++    return candidates[best];
++}
++#endif
++
 +static void waves_reverb_reset(struct effect *base)
 +{
 +    struct waves_reverb *effect = CONTAINING_RECORD(base, struct waves_reverb, effect);
@@ -2706,7 +3003,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  {
      struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
      return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
-@@ -890,22 +3013,55 @@
+@@ -890,22 +3309,55 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -2772,7 +3069,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const IDirectSoundFXWavesReverbVtbl waves_reverb_params_vtbl =
-@@ -935,6 +3091,7 @@
+@@ -935,6 +3387,7 @@
  {
      struct waves_reverb *effect = impl_waves_reverb_from_effect(iface);
  
@@ -2780,7 +3077,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -942,6 +3099,9 @@
+@@ -942,6 +3395,9 @@
  {
      .destroy = waves_reverb_destroy,
      .query_interface = waves_reverb_query_interface,
@@ -2790,7 +3087,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  };
  
  static HRESULT waves_reverb_create(IUnknown *outer, IUnknown **out)
-@@ -953,6 +3113,10 @@
+@@ -953,6 +3409,14 @@
  
      effect_init(&object->effect, outer, &waves_reverb_ops);
      object->IDirectSoundFXWavesReverb_iface.lpVtbl = &waves_reverb_params_vtbl;
@@ -2798,10 +3095,14 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    object->params.fReverbMix = DSFX_WAVESREVERB_REVERBMIX_DEFAULT;
 +    object->params.fReverbTime = DSFX_WAVESREVERB_REVERBTIME_DEFAULT;
 +    object->params.fHighFreqRTRatio = DSFX_WAVESREVERB_HIGHFREQRTRATIO_DEFAULT;
++
++#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
++    object->integer_network = waves_select_integer_network();
++#endif
  
      TRACE("Created waves reverb effect %p.\n", object);
      *out = &object->effect.IUnknown_inner;
-@@ -962,12 +3126,111 @@
+@@ -962,12 +3426,111 @@
  struct dmo_echofx
  {
      struct effect effect;
@@ -2914,7 +3215,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI echofx_QueryInterface(IDirectSoundFXEcho *iface, REFIID iid, void **out)
-@@ -988,20 +3251,37 @@
+@@ -988,20 +3551,37 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -2962,7 +3263,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXEchoVtbl echofx_vtbl =
-@@ -1021,16 +3301,13 @@
+@@ -1021,16 +3601,13 @@
  static void *echo_query_interface(struct effect *iface, REFIID iid)
  {
      struct dmo_echofx *effect = impl_echo_from_effect(iface);
@@ -2981,7 +3282,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1038,18 +3315,23 @@
+@@ -1038,18 +3615,23 @@
  {
      .destroy = echo_destroy,
      .query_interface = echo_query_interface,
@@ -3008,7 +3309,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      TRACE("Created echo effect %p.\n", object);
      *out = &object->effect.IUnknown_inner;
      return S_OK;
-@@ -1059,11 +3341,130 @@
+@@ -1059,11 +3641,130 @@
  {
      struct effect effect;
      IDirectSoundFXCompressor IDirectSoundFXCompressor_iface;
@@ -3139,7 +3440,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI compressorfx_QueryInterface(IDirectSoundFXCompressor *iface, REFIID iid, void **out)
-@@ -1084,20 +3485,36 @@
+@@ -1084,20 +3785,36 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -3190,7 +3491,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXCompressorVtbl compressor_vtbl =
-@@ -1108,7 +3525,6 @@
+@@ -1108,7 +3825,6 @@
      compressorfx_SetAllParameters,
      compressorfx_GetAllParameters
  };
@@ -3198,7 +3499,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  static struct dmo_compressorfx *impl_compressor_from_effect(struct effect *iface)
  {
      return CONTAINING_RECORD(iface, struct dmo_compressorfx, effect);
-@@ -1117,16 +3533,14 @@
+@@ -1117,16 +3833,14 @@
  static void *compressor_query_interface(struct effect *iface, REFIID iid)
  {
      struct dmo_compressorfx *effect = impl_compressor_from_effect(iface);
@@ -3218,7 +3519,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1134,32 +3548,378 @@
+@@ -1134,32 +3848,382 @@
  {
      .destroy = compressor_destroy,
      .query_interface = compressor_query_interface,
@@ -3279,8 +3580,12 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +
 +static float mod_r32(float value)
 +{
++#ifdef DSDMO_FLOAT32_REGISTERS
++    return value;
++#else
 +    volatile float rounded = value;
 +    return rounded;
++#endif
 +}
 +
 +static float mod_add(float left, float right)
@@ -3348,7 +3653,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +        remainder += 4096;
 +    }
 +    first = mod_delay_index(delay, frames);
-+    previous = mod_delay_index(delay, frames + 1);
++    previous = first ? first - 1 : delay->frames - 1;
 +    delayed = frames ? delay->data[channel][first] : current;
 +    previous_sample = delay->data[channel][previous];
 +    fraction = mod_r32((float)remainder / 4096.0f);
@@ -3471,7 +3776,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    for (frame = 0; frame < frames; ++frame)
 +    {
 +        BYTE *frame_data = data + frame * format->nBlockAlign;
-+        float input[2] = {0}, wet_sample[2], output[2], lfo_left, lfo_right;
++        float input[2] = {0}, wet_sample[2] = {0}, output[2], lfo_left, lfo_right;
 +
 +        for (channel = 0; channel < format->nChannels; ++channel)
 +        {
@@ -3573,7 +3878,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +    struct dmochorusfx *effect = CONTAINING_RECORD(base, struct dmochorusfx, effect);
 +
 +    /* Native wraps negative taps through 3.84 seconds of history after parameter updates. */
-+    return delay_prepare(&effect->state.delay, base->format.nChannels, base->format.nSamplesPerSec,
++    return delay_prepare(&effect->state.delay, 1, base->format.nSamplesPerSec,
 +            3.84 * base->format.nSamplesPerSec + 3);
 +}
 +
@@ -3601,7 +3906,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI chorusfx_QueryInterface(IDirectSoundFXChorus *iface, REFIID iid, void **out)
-@@ -1180,18 +3940,36 @@
+@@ -1180,18 +4244,36 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -3650,7 +3955,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXChorusVtbl chorus_vtbl =
-@@ -1202,7 +3980,6 @@
+@@ -1202,7 +4284,6 @@
      chorusfx_SetAllParameters,
      chorusfx_GetAllParameters
  };
@@ -3658,7 +3963,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  static struct dmochorusfx *implchorus_from_effect(struct effect *iface)
  {
      return CONTAINING_RECORD(iface, struct dmochorusfx, effect);
-@@ -1211,16 +3988,13 @@
+@@ -1211,16 +4292,13 @@
  static void *chorus_query_interface(struct effect *iface, REFIID iid)
  {
      struct dmochorusfx *effect = implchorus_from_effect(iface);
@@ -3677,7 +3982,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1228,18 +4002,26 @@
+@@ -1228,18 +4306,26 @@
  {
      .destroy = chorus_destroy,
      .query_interface = chorus_query_interface,
@@ -3708,7 +4013,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      TRACE("Created chorus effect %p.\n", object);
      *out = &object->effect.IUnknown_inner;
      return S_OK;
-@@ -1249,11 +4031,34 @@
+@@ -1249,11 +4335,34 @@
  {
      struct effect effect;
      IDirectSoundFXFlanger IDirectSoundFXFlanger_iface;
@@ -3744,7 +4049,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI flangerfx_QueryInterface(IDirectSoundFXFlanger *iface, REFIID iid, void **out)
-@@ -1274,18 +4079,36 @@
+@@ -1274,18 +4383,36 @@
      return IUnknown_Release(effect->effect.outer_unk);
  }
  
@@ -3793,7 +4098,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXFlangerVtbl flanger_vtbl =
-@@ -1296,7 +4119,6 @@
+@@ -1296,7 +4423,6 @@
      flangerfx_SetAllParameters,
      flangerfx_GetAllParameters
  };
@@ -3801,7 +4106,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  static struct dmo_flangerfx *impl_flanger_from_effect(struct effect *iface)
  {
      return CONTAINING_RECORD(iface, struct dmo_flangerfx, effect);
-@@ -1305,16 +4127,13 @@
+@@ -1305,16 +4431,13 @@
  static void *flanger_query_interface(struct effect *iface, REFIID iid)
  {
      struct dmo_flangerfx *effect = impl_flanger_from_effect(iface);
@@ -3820,7 +4125,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1322,18 +4141,24 @@
+@@ -1322,18 +4445,24 @@
  {
      .destroy = flanger_destroy,
      .query_interface = flanger_query_interface,
@@ -3849,7 +4154,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      TRACE("Created flanger effect %p.\n", object);
      *out = &object->effect.IUnknown_inner;
      return S_OK;
-@@ -1343,11 +4168,124 @@
+@@ -1343,11 +4472,130 @@
  {
      struct effect effect;
      IDirectSoundFXDistortion IDirectSoundFXDistortion_iface;
@@ -3906,6 +4211,12 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
 +
 +    value = isfinite(scaled) && scaled >= -2147483648.0f && scaled < 2147483648.0f ?
 +            (int32_t)scaled : INT32_MIN;
++#ifdef __i386__
++    /* The x86 reference retains the low 32 bits of the truncated 64-bit conversion. */
++    if (value == INT32_MIN)
++        value = isfinite(scaled) && scaled >= -9223372036854775808.0f
++                && scaled < 9223372036854775808.0f ? (int32_t)(uint32_t)(int64_t)scaled : 0;
++#endif
 +    magnitude = value < 0 ? -(uint32_t)value : (uint32_t)value;
 +    if (!magnitude)
 +        return 0.0f;
@@ -3975,7 +4286,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI distortion_QueryInterface(IDirectSoundFXDistortion *iface, REFIID iid, void **out)
-@@ -1370,16 +4308,70 @@
+@@ -1370,16 +4618,70 @@
  
  static HRESULT WINAPI distortion_SetAllParameters(IDirectSoundFXDistortion *iface, const DSFXDistortion *params)
  {
@@ -4052,7 +4363,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXDistortionVtbl distortion_vtbl =
-@@ -1390,7 +4382,6 @@
+@@ -1390,7 +4692,6 @@
      distortion_SetAllParameters,
      distortion_GetAllParameters
  };
@@ -4060,7 +4371,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  static struct distortion *impl_distortion_from_effect(struct effect *iface)
  {
      return CONTAINING_RECORD(iface, struct distortion, effect);
-@@ -1399,16 +4390,13 @@
+@@ -1399,16 +4700,13 @@
  static void *distortion_query_interface(struct effect *iface, REFIID iid)
  {
      struct distortion *effect = impl_distortion_from_effect(iface);
@@ -4079,7 +4390,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1416,18 +4404,21 @@
+@@ -1416,18 +4714,21 @@
  {
      .destroy = distortion_destroy,
      .query_interface = distortion_query_interface,
@@ -4105,7 +4416,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      TRACE("Created distortion effect %p.\n", object);
      *out = &object->effect.IUnknown_inner;
      return S_OK;
-@@ -1437,11 +4428,94 @@
+@@ -1437,11 +4738,94 @@
  {
      struct effect effect;
      IDirectSoundFXGargle IDirectSoundFXGargle_iface;
@@ -4201,7 +4512,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static HRESULT WINAPI gargle_QueryInterface(IDirectSoundFXGargle *iface, REFIID iid, void **out)
-@@ -1464,16 +4538,31 @@
+@@ -1464,16 +4848,31 @@
  
  static HRESULT WINAPI gargle_SetAllParameters(IDirectSoundFXGargle *iface, const DSFXGargle *params)
  {
@@ -4239,7 +4550,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  }
  
  static const struct IDirectSoundFXGargleVtbl gargle_vtbl =
-@@ -1484,7 +4573,6 @@
+@@ -1484,7 +4883,6 @@
      gargle_SetAllParameters,
      gargle_GetAllParameters
  };
@@ -4247,7 +4558,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
  static struct gargle *impl_gargle_from_effect(struct effect *iface)
  {
      return CONTAINING_RECORD(iface, struct gargle, effect);
-@@ -1493,16 +4581,12 @@
+@@ -1493,16 +4891,12 @@
  static void *gargle_query_interface(struct effect *iface, REFIID iid)
  {
      struct gargle *effect = impl_gargle_from_effect(iface);
@@ -4265,7 +4576,7 @@ diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
      free(effect);
  }
  
-@@ -1510,20 +4594,85 @@
+@@ -1510,20 +4904,85 @@
  {
      .destroy = gargle_destroy,
      .query_interface = gargle_query_interface,
@@ -4793,7 +5104,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
  
      memset(&params, 0xcc, sizeof(params));
      hr = IDirectSoundFXI3DL2Reverb_GetAllParameters(reverb, &params);
-@@ -542,6 +804,4398 @@
+@@ -542,6 +804,4689 @@
  
      ref = IDirectSoundFXI3DL2Reverb_Release(reverb);
      ok(!ref, "Got outstanding refcount %ld.\n", ref);
@@ -6182,6 +6493,52 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +    IMediaObject_Release(dmo);
 +}
 +
++static void test_echo_pcm16_truncation(void)
++{
++    static const SHORT input[] = {-32768, -32767, -16385, -16384, -3, -2, -1, 0,
++            1, 2, 3, 16383, 16384, 16385, 32766, 32767};
++    static const SHORT expected[] = {-16384, -16383, -8192, -8192, -1, -1, 0, 0,
++            0, 1, 1, 8191, 8192, 8192, 16383, 16383};
++    DSFXEcho params = {50.0f, 0.0f, 500.0f, 500.0f, FALSE};
++    IMediaObjectInPlace *inplace;
++    IDirectSoundFXEcho *echo;
++    IMediaObject *dmo;
++    SHORT samples[ARRAY_SIZE(input)];
++    unsigned int channels, i;
++    HRESULT hr;
++
++    for (channels = 1; channels <= 2; ++channels)
++    {
++        hr = CoCreateInstance(&GUID_DSFX_STANDARD_ECHO, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMediaObject, (void **)&dmo);
++        ok(hr == S_OK, "Got hr %#lx creating Echo.\n", hr);
++        if (FAILED(hr)) continue;
++        hr = set_pcm16_format(dmo, 48000, channels);
++        ok(hr == S_OK, "Got hr %#lx setting PCM16 format.\n", hr);
++        hr = IMediaObject_QueryInterface(dmo, &IID_IDirectSoundFXEcho, (void **)&echo);
++        ok(hr == S_OK, "Got hr %#lx querying Echo.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IDirectSoundFXEcho_SetAllParameters(echo, &params);
++            ok(hr == S_OK, "Got hr %#lx setting Echo parameters.\n", hr);
++            IDirectSoundFXEcho_Release(echo);
++        }
++        hr = IMediaObject_QueryInterface(dmo, &IID_IMediaObjectInPlace, (void **)&inplace);
++        ok(hr == S_OK, "Got hr %#lx querying in-place.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            memcpy(samples, input, sizeof(samples));
++            hr = IMediaObjectInPlace_Process(inplace, sizeof(samples), (BYTE *)samples, 0, DMO_INPLACE_NORMAL);
++            ok(hr == S_OK, "Got hr %#lx processing PCM16.\n", hr);
++            for (i = 0; i < ARRAY_SIZE(samples); ++i)
++                ok(samples[i] == expected[i], "%u channels, sample %u: got %d, expected %d.\n",
++                        channels, i, samples[i], expected[i]);
++            IMediaObjectInPlace_Release(inplace);
++        }
++        IMediaObject_Release(dmo);
++    }
++}
++
 +static void test_echo_delay_change(void)
 +{
 +    WAVEFORMATEX wfx;
@@ -6749,12 +7106,82 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +                }
 +}
 +
++#ifdef __i386__
++static void test_distortion_conversion_overflow(void)
++{
++    static const SHORT expected[] = {1226, 3473, 6402, 9660, 12956, 12480, 9362, 4640};
++    DSFXDistortion params = {-18.0f, 15.0f, 2400.0f, 2400.0f, 8000.0f};
++    IDirectSoundFXDistortion *effect = NULL;
++    IMediaObjectInPlace *inplace = NULL;
++    IMediaObject *dmo = NULL;
++    SHORT pcm[64];
++    float floating[64];
++    unsigned int sign, i;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&GUID_DSFX_STANDARD_DISTORTION, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IMediaObject, (void **)&dmo);
++    ok(hr == S_OK, "Got hr %#lx creating distortion.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IMediaObject_QueryInterface(dmo, &IID_IDirectSoundFXDistortion, (void **)&effect);
++    ok(hr == S_OK, "Got hr %#lx querying distortion parameters.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IMediaObject_QueryInterface(dmo, &IID_IMediaObjectInPlace, (void **)&inplace);
++    ok(hr == S_OK, "Got hr %#lx querying in-place.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IDirectSoundFXDistortion_SetAllParameters(effect, &params);
++    ok(hr == S_OK, "Got hr %#lx setting distortion parameters.\n", hr);
++    hr = set_pcm16_format(dmo, 48000, 2);
++    ok(hr == S_OK, "Got hr %#lx setting PCM16 format.\n", hr);
++    for (sign = 0; sign < 2; ++sign)
++    {
++        hr = IMediaObject_Flush(dmo);
++        ok(hr == S_OK, "Got hr %#lx flushing distortion.\n", hr);
++        memset(pcm, 0, sizeof(pcm));
++        for (i = 0; i < ARRAY_SIZE(expected); ++i)
++            pcm[2 * i] = sign ? -32768 : 32767;
++        hr = IMediaObjectInPlace_Process(inplace, sizeof(pcm), (BYTE *)pcm, 0, DMO_INPLACE_NORMAL);
++        ok(hr == S_OK, "Got hr %#lx processing PCM16 burst.\n", hr);
++        for (i = 0; i < ARRAY_SIZE(expected); ++i)
++        {
++            int value = sign ? -expected[i] : expected[i];
++            ok(abs(pcm[2 * i] - value) <= 1, "Sign %u sample %u: got %d, expected %d.\n",
++                    sign, i, pcm[2 * i], value);
++        }
++        for (i = 0; i < ARRAY_SIZE(pcm) / 2; ++i)
++            ok(!pcm[2 * i + 1], "Right channel sample %u: got %d.\n", i, pcm[2 * i + 1]);
++    }
++    hr = set_float_format(dmo, 48000, 2);
++    ok(hr == S_OK, "Got hr %#lx setting float format.\n", hr);
++    for (sign = 0; sign < 2; ++sign)
++    {
++        hr = IMediaObject_Flush(dmo);
++        ok(hr == S_OK, "Got hr %#lx flushing distortion.\n", hr);
++        memset(floating, 0, sizeof(floating));
++        floating[0] = sign ? -1.0e20f : 1.0e20f;
++        hr = IMediaObjectInPlace_Process(inplace, sizeof(floating), (BYTE *)floating, 0, DMO_INPLACE_NORMAL);
++        ok(hr == S_OK, "Got hr %#lx processing large finite float.\n", hr);
++        for (i = 0; i < ARRAY_SIZE(floating); ++i)
++            ok(floating[i] == 0.0f, "Sign %u sample %u: got %.9g.\n", sign, i, floating[i]);
++    }
++
++done:
++    if (inplace) IMediaObjectInPlace_Release(inplace);
++    if (effect) IDirectSoundFXDistortion_Release(effect);
++    if (dmo) IMediaObject_Release(dmo);
++}
++#endif
++
 +static void test_distortion_compact_pcm16_endpoint(void)
 +{
 +    static const SHORT levels[] = {1, -1, 64, -64, 32767, -32768};
 +    static const DWORD frames_to_check[] =
 +            {23998, 23999, 24000, 24001, 29998, 29999, 30000, 30001};
++#ifdef __i386__
++    static const SHORT expected[] = {-15587, -15587, -12640, -7752, 18715, 18715, 15474, 10089};
++#else
 +    static const SHORT expected[] = {-15586, -15586, -12640, -7751, 0, 0, 0, 0};
++#endif
 +    enum { frames = 30004 };
 +    DSFXDistortion params = {-18.0f, 100.0f, 2400.0f, 2400.0f, 8000.0f};
 +    IDirectSoundFXDistortion *effect = NULL;
@@ -7001,6 +7428,166 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +            HeapFree(GetProcessHeap(), 0, data);
 +        winetest_pop_context();
 +    }
++}
++
++static void test_reverb_ring_chunks(void)
++{
++    static const struct
++    {
++        const GUID *clsid;
++        const char *name;
++        BOOL i3dl2;
++    }
++    effects[] =
++    {
++        {&GUID_DSFX_STANDARD_I3DL2REVERB, "I3DL2", TRUE},
++        {&GUID_DSFX_WAVES_REVERB, "Waves", FALSE},
++    };
++    static const struct
++    {
++        WORD format;
++        const char *name;
++    }
++    formats[] =
++    {
++        {WAVE_FORMAT_IEEE_FLOAT, "F32"},
++        {WAVE_FORMAT_PCM, "PCM16"},
++    };
++    static const WORD channels[] = {1, 2};
++    static const DWORD chunks[] = {127, 512, 1, 257};
++    enum { frames = 96000 };
++    unsigned int effect_index, format_index, channel_index, quality;
++
++    for (effect_index = 0; effect_index < ARRAY_SIZE(effects); ++effect_index)
++        for (format_index = 0; format_index < ARRAY_SIZE(formats); ++format_index)
++            for (channel_index = 0; channel_index < ARRAY_SIZE(channels); ++channel_index)
++                for (quality = 0; quality < (effects[effect_index].i3dl2 ? 4 : 1); ++quality)
++                {
++                    const WORD format = formats[format_index].format;
++                    const WORD channel_count = channels[channel_index];
++                    const DWORD frame_bytes = channel_count
++                            * (format == WAVE_FORMAT_PCM ? sizeof(SHORT) : sizeof(float));
++                    const DWORD bytes = frames * frame_bytes;
++                    IMediaObject *dmo = NULL;
++                    IMediaObjectInPlace *inplace = NULL;
++                    IDirectSoundFXI3DL2Reverb *reverb = NULL;
++                    BYTE *input = NULL, *one_shot = NULL, *chunked = NULL;
++                    HRESULT hr;
++                    DWORD offset, chunk_index;
++
++                    if (effects[effect_index].i3dl2)
++                        winetest_push_context("%s Q%u %s %u-channel", effects[effect_index].name,
++                                quality, formats[format_index].name, channel_count);
++                    else
++                        winetest_push_context("%s %s %u-channel", effects[effect_index].name,
++                                formats[format_index].name, channel_count);
++
++                    input = HeapAlloc(GetProcessHeap(), 0, bytes);
++                    one_shot = HeapAlloc(GetProcessHeap(), 0, bytes);
++                    chunked = HeapAlloc(GetProcessHeap(), 0, bytes);
++                    ok(input && one_shot && chunked, "Could not allocate %lu-byte reverb buffers.\n",
++                            bytes);
++                    if (!input || !one_shot || !chunked)
++                        goto done;
++                    compressor_blackbox_fill_input(input, format, channel_count, frames, FALSE);
++                    memcpy(one_shot, input, bytes);
++                    memcpy(chunked, input, bytes);
++
++                    hr = CoCreateInstance(effects[effect_index].clsid, NULL, CLSCTX_INPROC_SERVER,
++                            &IID_IMediaObject, (void **)&dmo);
++                    ok(hr == S_OK, "Got hr %#lx creating %s reverb.\n", hr,
++                            effects[effect_index].name);
++                    if (FAILED(hr))
++                        goto done;
++                    hr = format == WAVE_FORMAT_PCM
++                            ? set_pcm16_format(dmo, 48000, channel_count)
++                            : set_float_format(dmo, 48000, channel_count);
++                    ok(hr == S_OK, "Got hr %#lx setting %s format.\n", hr,
++                            formats[format_index].name);
++                    if (FAILED(hr))
++                        goto done;
++                    hr = IMediaObject_QueryInterface(dmo, &IID_IMediaObjectInPlace,
++                            (void **)&inplace);
++                    ok(hr == S_OK, "Got hr %#lx querying in-place interface.\n", hr);
++                    if (FAILED(hr))
++                        goto done;
++                    if (effects[effect_index].i3dl2)
++                    {
++                        hr = IMediaObject_QueryInterface(dmo, &IID_IDirectSoundFXI3DL2Reverb,
++                                (void **)&reverb);
++                        ok(hr == S_OK, "Got hr %#lx querying I3DL2 parameters.\n", hr);
++                        if (FAILED(hr))
++                            goto done;
++                        hr = IDirectSoundFXI3DL2Reverb_SetQuality(reverb, quality);
++                        ok(hr == S_OK, "Got hr %#lx setting I3DL2 quality %u.\n", hr, quality);
++                        if (FAILED(hr))
++                            goto done;
++                    }
++                    hr = IMediaObject_AllocateStreamingResources(dmo);
++                    ok(hr == S_OK, "Got hr %#lx allocating reverb resources.\n", hr);
++                    if (FAILED(hr))
++                        goto done;
++
++                    hr = IMediaObjectInPlace_Process(inplace, bytes, one_shot, 0,
++                            DMO_INPLACE_NORMAL);
++                    ok(hr == S_OK, "Got hr %#lx processing one-shot input.\n", hr);
++                    if (FAILED(hr))
++                        goto done;
++                    hr = IMediaObject_Flush(dmo);
++                    ok(hr == S_OK, "Got hr %#lx flushing reverb state.\n", hr);
++                    if (FAILED(hr))
++                        goto done;
++
++                    offset = 0;
++                    chunk_index = 0;
++                    while (offset < frames)
++                    {
++                        DWORD requested = chunks[chunk_index++ % ARRAY_SIZE(chunks)];
++                        DWORD count = requested < frames - offset ? requested : frames - offset;
++
++                        hr = IMediaObjectInPlace_Process(inplace, count * frame_bytes,
++                                chunked + (SIZE_T)offset * frame_bytes, 0, DMO_INPLACE_NORMAL);
++                        ok(hr == S_OK, "Got hr %#lx processing chunk at frame %lu.\n", hr, offset);
++                        if (FAILED(hr))
++                            goto done;
++                        offset += count;
++                    }
++
++                    {
++                        DWORD mismatch_count = 0, first_mismatch = 0;
++                        BYTE expected = 0, actual = 0;
++
++                        for (offset = 0; offset < bytes; ++offset)
++                            if (one_shot[offset] != chunked[offset])
++                            {
++                                if (!mismatch_count)
++                                {
++                                    first_mismatch = offset;
++                                    expected = one_shot[offset];
++                                    actual = chunked[offset];
++                                }
++                                ++mismatch_count;
++                            }
++                        ok(!mismatch_count,
++                                "One-shot and chunked output differ at %lu bytes (first byte %lu: %#x vs %#x).\n",
++                                mismatch_count, first_mismatch, expected, actual);
++                    }
++
++done:
++                    if (reverb)
++                        IDirectSoundFXI3DL2Reverb_Release(reverb);
++                    if (inplace)
++                        IMediaObjectInPlace_Release(inplace);
++                    if (dmo)
++                        IMediaObject_Release(dmo);
++                    if (input)
++                        HeapFree(GetProcessHeap(), 0, input);
++                    if (one_shot)
++                        HeapFree(GetProcessHeap(), 0, one_shot);
++                    if (chunked)
++                        HeapFree(GetProcessHeap(), 0, chunked);
++                    winetest_pop_context();
++                }
 +}
 +
 +struct mod_compact_tap
@@ -8046,6 +8633,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +
 +static void test_chorus_negative_delay_rates(void)
 +{
++    static const DWORD chunks[] = {127, 512, 1, 257};
 +    struct negative_delay_case
 +    {
 +        DWORD rate;
@@ -8123,9 +8711,23 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +        ok(hr == S_OK, "Got hr %#lx allocating negative-delay resources.\n", hr);
 +        if (FAILED(hr))
 +            goto cleanup;
-+        hr = IMediaObjectInPlace_Process(inplace, (ULONG)bytes, (BYTE *)data, 0,
-+                DMO_INPLACE_NORMAL);
-+        ok(hr == S_OK, "Got hr %#lx processing negative-delay history.\n", hr);
++        {
++            DWORD offset = 0, chunk_index = 0;
++
++            while (offset < frame_count)
++            {
++                DWORD requested = chunks[chunk_index++ % ARRAY_SIZE(chunks)];
++                DWORD count = requested < frame_count - offset ? requested : frame_count - offset;
++
++                hr = IMediaObjectInPlace_Process(inplace, count * 2 * sizeof(float),
++                        (BYTE *)data + offset * 2 * sizeof(float), 0, DMO_INPLACE_NORMAL);
++                ok(hr == S_OK, "Got hr %#lx processing negative-delay chunk at frame %lu.\n",
++                        hr, offset);
++                if (FAILED(hr))
++                    break;
++                offset += count;
++            }
++        }
 +        if (SUCCEEDED(hr))
 +        {
 +            double expected_sum[2] = {0.0, 0.0};
@@ -9192,7 +9794,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
  }
  
  START_TEST(dsdmo)
-@@ -567,6 +5221,15 @@
+@@ -567,6 +5512,15 @@
  
      CoInitializeEx(NULL, COINIT_MULTITHREADED);
  
@@ -9208,7 +9810,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
      for (i = 0; i < ARRAY_SIZE(tests); ++i)
      {
          IUnknown *unk;
-@@ -585,13 +5248,53 @@
+@@ -585,13 +5539,58 @@
      }
  
      test_chorus_parameters();
@@ -9221,6 +9823,9 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
      test_distortion_parameters();
 +    test_distortion_compact_impulses();
 +    test_distortion_compact_pcm16_endpoint();
++#ifdef __i386__
++    test_distortion_conversion_overflow();
++#endif
 +    test_distortion_rate_and_bands();
      test_echo_parameters();
      test_flanger_parameters();
@@ -9230,6 +9835,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +    test_waves_reverb_parameters();
 +    test_waves_reverb_mix();
 +    test_waves_compact_reference();
++    test_reverb_ring_chunks();
      test_eq_parameters();
 +    test_eq_rate_clamp();
 +    test_reverb_process(&GUID_DSFX_STANDARD_I3DL2REVERB);
@@ -9247,6 +9853,7 @@ diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
 +    test_echo_complete();
 +    test_echo_impulse();
 +    test_echo_pcm();
++    test_echo_pcm16_truncation();
 +    test_subframe_delay();
 +    test_mod_delay_capacity();
 +    test_chorus_delay_center();
