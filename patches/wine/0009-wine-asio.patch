@@ -38,7 +38,7 @@ diff --git a/dlls/protonasio/asio.c b/dlls/protonasio/asio.c
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/asio.c
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,785 @@
 +/*
 + * ASIO playback driver for PipeWire.
 + *
@@ -91,7 +91,7 @@ new file mode 100644
 +    HMODULE module;
 +    DWORD thread_id;
 +    LONG started, error, destroy_pending, reset_notified, latency, channel_mask;
-+    BOOL time_info, have_position;
++    BOOL time_info, have_position, resync_pending;
 +};
 +
 +static struct asio_driver *impl_from_IASIO(IASIO *iface)
@@ -357,11 +357,17 @@ new file mode 100644
 +        if (!callback_cancelled(driver)) callback_reset(driver);
 +        return ASE_HWMalfunction;
 +    }
++    if (params.result == ASIO_WRITE_DROPPED)
++    {
++        WARN("Dropped late ASIO ticket %llu.\n", (unsigned long long)ticket->id);
++        driver->resync_pending = TRUE;
++        return ASE_OK;
++    }
 +    if (params.result != ASE_OK && !callback_cancelled(driver)) callback_reset(driver);
 +    return asio_result(params.result);
 +}
 +
-+static LONG fill_block(struct asio_driver *driver, LONG index, const struct asio_ticket *ticket)
++static LONG fill_block(struct asio_driver *driver, LONG *index, const struct asio_ticket *ticket)
 +{
 +    ASIOTime time = {0};
 +    BOOL latency_changed, time_valid, resync;
@@ -373,7 +379,11 @@ new file mode 100644
 +    EnterCriticalSection(&driver->position_lock);
 +    resync = !driver->time_state.invalid;
 +    time_valid = asio_time_validate(&driver->time_state, ticket->clock_position, ticket->nanoseconds);
-+    resync = resync && !time_valid;
++    resync = (resync && !time_valid) || driver->resync_pending || (!driver->have_position
++            && ticket->position) || (driver->have_position
++            && ticket->position > driver->position
++            && ticket->position - driver->position > driver->frames);
++    driver->resync_pending = FALSE;
 +    timestamp = time_valid ? ticket->nanoseconds : 0;
 +    driver->position = ticket->position;
 +    driver->timestamp = timestamp;
@@ -399,8 +409,8 @@ new file mode 100644
 +    {
 +        if (callback_cancelled(driver)) return ASE_InvalidMode;
 +        WARN("ASIO ticket %llu expired before host callback.\n", (unsigned long long)ticket->id);
-+        callback_reset(driver);
-+        return ASE_HWMalfunction;
++        driver->resync_pending = TRUE;
++        return ASE_OK;
 +    }
 +    if (callback_cancelled(driver)) return ASE_InvalidMode;
 +
@@ -411,10 +421,12 @@ new file mode 100644
 +        time.timeInfo.flags = kSamplePositionValid | kSampleRateValid | kSystemTimeValid;
 +        time.timeInfo.speed = 1.0;
 +        time.timeInfo.sampleRate = driver->rate;
-+        driver->callbacks.bufferSwitchTimeInfo(&time, index, TRUE);
++        driver->callbacks.bufferSwitchTimeInfo(&time, *index, TRUE);
 +    }
-+    else driver->callbacks.bufferSwitch(index, TRUE);
-+    return write_block(driver, index, ticket);
++    else driver->callbacks.bufferSwitch(*index, TRUE);
++    result = write_block(driver, *index, ticket);
++    *index ^= 1;
++    return result;
 +}
 +
 +static LONG wait_ticket(struct asio_driver *driver, struct asio_wait_params *params)
@@ -455,16 +467,14 @@ new file mode 100644
 +    if (result == ASE_OK) result = wait_ticket(driver, &params);
 +    if (result == ASE_OK && params.result)
 +    {
-+        result = fill_block(driver, index, &params.ticket);
-+        index ^= 1;
++        result = fill_block(driver, &index, &params.ticket);
 +    }
 +    InterlockedExchange(&driver->error, result);
 +    SetEvent(driver->ready);
 +    while (result == ASE_OK)
 +    {
 +        if ((result = wait_ticket(driver, &params)) != ASE_OK || !params.result) break;
-+        result = fill_block(driver, index, &params.ticket);
-+        index ^= 1;
++        result = fill_block(driver, &index, &params.ticket);
 +    }
 +    InterlockedExchange(&driver->error, result);
 +    InterlockedExchange(&driver->started, FALSE);
@@ -491,6 +501,7 @@ new file mode 100644
 +        driver->position = driver->timestamp = 0;
 +        memset(&driver->time_state, 0, sizeof(driver->time_state));
 +        driver->have_position = FALSE;
++        driver->resync_pending = FALSE;
 +        LeaveCriticalSection(&driver->position_lock);
 +        InterlockedExchange(&driver->started, TRUE);
 +        /* Keep callback code loaded until the worker has exited. */
@@ -2022,6 +2033,8 @@ new file mode 100644
 +            return STATUS_SUCCESS;
 +        }
 +        id = stream->next_block;
++        if (!asio_queue_next_block(&stream->queue, id, &id)) return STATUS_SUCCESS;
++        stream->next_block = id;
 +        generation = __atomic_load_n(&stream->generation, __ATOMIC_ACQUIRE);
 +        if (asio_clock_reserve(&stream->clock, id, stream->frames, &timing))
 +        {
@@ -2068,15 +2081,13 @@ new file mode 100644
 +                if (id && (now < ns || period_ns == UINT64_MAX || now - ns >= period_ns))
 +                {
 +                    if (now < ns) continue;
-+                    WARN("ASIO ticket %llu expired during admission.\n", (unsigned long long)id);
-+                    stream_fail(stream, -ETIMEDOUT);
-+                    return STATUS_SUCCESS;
++                    ++stream->next_block;
++                    continue;
 +                }
 +                if (__atomic_load_n(&stream->queue.deadline_position, __ATOMIC_ACQUIRE) > output)
 +                {
-+                    WARN("ASIO ticket %llu missed its PCM deadline.\n", (unsigned long long)id);
-+                    stream_fail(stream, -ETIMEDOUT);
-+                    return STATUS_SUCCESS;
++                    ++stream->next_block;
++                    continue;
 +                }
 +                if (__atomic_load_n(&stream->failed, __ATOMIC_ACQUIRE)
 +                        || !__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE)
@@ -2153,9 +2164,9 @@ new file mode 100644
 +    }
 +    else if (result == ASIO_LATE)
 +    {
-+        /* A late callback would silently skip its PCM; abort the stream instead. */
-+        stream_fail(stream, -ETIMEDOUT);
-+        params->result = ASE_HWMalfunction;
++        /* Late PCM must not be replayed; the next reservation follows the live clock. */
++        ++stream->next_block;
++        params->result = ASIO_WRITE_DROPPED;
 +    }
 +    else params->result = ASE_HWMalfunction;
 +done:
@@ -2440,7 +2451,7 @@ diff --git a/dlls/protonasio/tests/asio.c b/dlls/protonasio/tests/asio.c
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/tests/asio.c
-@@ -0,0 +1,1655 @@
+@@ -0,0 +1,1721 @@
 +/*
 + * Native regression tests for the Proton-BM ASIO driver.
 + *
@@ -2470,6 +2481,8 @@ new file mode 100644
 +enum
 +{
 +    kAsioSelectorSupported = 1,
++    kAsioResetRequest = 3,
++    kAsioResyncRequest = 5,
 +    kAsioLatenciesChanged = 6,
 +    kAsioSupportsTimeInfo = 7,
 +    kAsioCanTimeInfo = 10,
@@ -2499,6 +2512,8 @@ new file mode 100644
 +    volatile LONG time_info_pair_mismatches;
 +    volatile LONG time_info_invalid;
 +    volatile LONG latency_notifications;
++    volatile LONG resync_notifications, reset_notifications;
++    volatile LONG delay_next_callback, delays_completed;
 +    volatile LONG last_plain_index;
 +    volatile LONG last_time_index;
 +    volatile LONG release_armed;
@@ -2512,6 +2527,7 @@ new file mode 100644
 +    ASIOSamples reentrant_timestamps[MAX_CLOCK_RECORDS];
 +    ASIOSamples time_info_positions[MAX_CLOCK_RECORDS];
 +    ASIOSamples time_info_timestamps[MAX_CLOCK_RECORDS];
++    LONG reentrant_resyncs[MAX_CLOCK_RECORDS], time_info_resyncs[MAX_CLOCK_RECORDS];
 +    ULONGLONG callback_entry_timestamps[MAX_CLOCK_RECORDS];
 +} callback_state;
 +
@@ -2529,6 +2545,8 @@ new file mode 100644
 +    callback_state.time_info_pair_mismatches = 0;
 +    callback_state.time_info_invalid = 0;
 +    callback_state.latency_notifications = 0;
++    callback_state.resync_notifications = callback_state.reset_notifications = 0;
++    callback_state.delay_next_callback = callback_state.delays_completed = 0;
 +    callback_state.last_plain_index = -1;
 +    callback_state.last_time_index = -1;
 +    callback_state.release_armed = 0;
@@ -2540,6 +2558,8 @@ new file mode 100644
 +    memset(callback_state.reentrant_timestamps, 0, sizeof(callback_state.reentrant_timestamps));
 +    memset(callback_state.time_info_positions, 0, sizeof(callback_state.time_info_positions));
 +    memset(callback_state.time_info_timestamps, 0, sizeof(callback_state.time_info_timestamps));
++    memset(callback_state.reentrant_resyncs, 0, sizeof(callback_state.reentrant_resyncs));
++    memset(callback_state.time_info_resyncs, 0, sizeof(callback_state.time_info_resyncs));
 +    memset(callback_state.callback_entry_timestamps, 0, sizeof(callback_state.callback_entry_timestamps));
 +}
 +
@@ -2605,6 +2625,7 @@ new file mode 100644
 +        {
 +            callback_state.reentrant_positions[slot] = position;
 +            callback_state.reentrant_timestamps[slot] = timestamp;
++            callback_state.reentrant_resyncs[slot] = callback_state.resync_notifications;
 +        }
 +        if (time_info && (!samples_equal(position, time_info->samplePosition)
 +                || !samples_equal(timestamp, time_info->systemTime)))
@@ -2637,12 +2658,22 @@ new file mode 100644
 +        InterlockedOr(&callback_state.seen_indices, 1 << index);
 +}
 +
++static void delay_callback(void)
++{
++    LONG delay = InterlockedExchange(&callback_state.delay_next_callback, 0);
++
++    if (!delay) return;
++    Sleep(delay);
++    InterlockedIncrement(&callback_state.delays_completed);
++}
++
 +static void __cdecl callback_buffer_switch(LONG index, LONG direct_process)
 +{
 +    (void)direct_process;
 +    check_reentrant_metadata(NULL);
 +    record_callback(&callback_state.plain_callbacks, &callback_state.last_plain_index, index);
 +    clear_output_buffer(index);
++    delay_callback();
 +    SetEvent(callback_state.event);
 +}
 +
@@ -2680,6 +2711,16 @@ new file mode 100644
 +
 +static LONG __cdecl callback_asio_message(LONG selector, LONG value, void *message, double *opt)
 +{
++    if (selector == kAsioResetRequest)
++    {
++        InterlockedIncrement(&callback_state.reset_notifications);
++        return 1;
++    }
++    if (selector == kAsioResyncRequest)
++    {
++        InterlockedIncrement(&callback_state.resync_notifications);
++        return 1;
++    }
 +    if (selector == kAsioLatenciesChanged)
 +    {
 +        InterlockedIncrement(&callback_state.latency_notifications);
@@ -2719,11 +2760,13 @@ new file mode 100644
 +        {
 +            callback_state.time_info_positions[slot] = params->timeInfo.samplePosition;
 +            callback_state.time_info_timestamps[slot] = params->timeInfo.systemTime;
++            callback_state.time_info_resyncs[slot] = callback_state.resync_notifications;
 +            callback_state.callback_entry_timestamps[slot] = entry_timestamp;
 +        }
 +    }
 +    record_callback(&callback_state.time_callbacks, &callback_state.last_time_index, index);
 +    clear_output_buffer(index);
++    delay_callback();
 +    SetEvent(callback_state.event);
 +    return params;
 +}
@@ -2731,18 +2774,10 @@ new file mode 100644
 +static LONG __cdecl callback_asio_message_without_time_info(LONG selector, LONG value,
 +        void *message, double *opt)
 +{
-+    if (selector == kAsioLatenciesChanged)
-+    {
-+        InterlockedIncrement(&callback_state.latency_notifications);
-+        return 1;
-+    }
-+    if (selector == kAsioSelectorSupported && value == kAsioLatenciesChanged)
-+        return 1;
-+    (void)selector;
-+    (void)value;
-+    (void)message;
-+    (void)opt;
-+    return 0;
++    if (selector == kAsioSupportsTimeInfo
++            || (selector == kAsioSelectorSupported && value == kAsioSupportsTimeInfo))
++        return 0;
++    return callback_asio_message(selector, value, message, opt);
 +}
 +
 +static ASIOCallbacks callbacks =
@@ -2981,6 +3016,7 @@ new file mode 100644
 +                                       : callback_state.reentrant_positions;
 +    ASIOSamples *timestamps = time_info ? callback_state.time_info_timestamps
 +                                        : callback_state.reentrant_timestamps;
++    LONG *resyncs = time_info ? callback_state.time_info_resyncs : callback_state.reentrant_resyncs;
 +    LONG records = time_info ? callback_state.time_info_records
 +                             : callback_state.reentrant_records;
 +    ULONGLONG nominal_step = (ULONGLONG)((double)buffer_size * 1000000000.0 / rate + 0.5);
@@ -2995,8 +3031,16 @@ new file mode 100644
 +    for (i = 0; i < MAX_CLOCK_RECORDS && i < records; ++i)
 +    {
 +        ULONGLONG current_timestamp = samples_value(timestamps[i]);
++        ULONGLONG current_position = samples_value(positions[i]);
++        BOOL resynced = i && resyncs[i] != resyncs[i - 1];
 +
-+        if (samples_value(positions[i]) != (ULONGLONG)i * buffer_size)
++        if (current_position % buffer_size) positions_ok = FALSE;
++        if (!i)
++        {
++            if (!resyncs[i] && current_position) positions_ok = FALSE;
++        }
++        else if (current_position <= samples_value(positions[i - 1])
++                || (!resynced && current_position - samples_value(positions[i - 1]) != buffer_size))
 +            positions_ok = FALSE;
 +        if (!current_timestamp)
 +            timestamps_ok = FALSE;
@@ -3016,7 +3060,7 @@ new file mode 100644
 +            /* Live graph/system clock observations have microsecond-scale noise. */
 +            min_step = min_step > observation_tolerance ? min_step - observation_tolerance : 0;
 +            if (current_timestamp <= previous_timestamp
-+                    || delta < min_step || delta > max_step)
++                    || (!resynced && (delta < min_step || delta > max_step)))
 +                timestamps_ok = FALSE;
 +        }
 +    }
@@ -3032,12 +3076,12 @@ new file mode 100644
 +
 +    ok(records >= 4, "%s %.0f Hz/%ld frames recorded only %ld callback clock samples.\n",
 +            label, rate, buffer_size, records);
-+    ok(positions_ok, "%s %.0f Hz/%ld frames positions were not 0,B,2B,3B.\n",
++    ok(positions_ok, "%s %.0f Hz/%ld frames positions did not follow the ASIO periods/resync.\n",
 +            label, rate, buffer_size);
 +    if (!timestamps_ok)
 +        for (i = 0; i < MAX_CLOCK_RECORDS && i < records; ++i)
-+            trace("Clock sample %ld: position %I64u, timestamp %I64u.\n", i,
-+                  samples_value(positions[i]), samples_value(timestamps[i]));
++            trace("Clock sample %ld: position %I64u, timestamp %I64u, resync %ld.\n", i,
++                  samples_value(positions[i]), samples_value(timestamps[i]), resyncs[i]);
 +    ok(timestamps_ok, "%s %.0f Hz/%ld frames timestamps were not monotonic/rate-bounded.\n",
 +            label, rate, buffer_size);
 +    ok(epoch_ok, "%s %.0f Hz/%ld frames first timestamp was not in the QPC start interval.\n",
@@ -3047,6 +3091,36 @@ new file mode 100644
 +            "%s %.0f Hz/%ld frames callback metadata failed: reentrant %ld, pair %ld, time-info %ld.\n",
 +            label, rate, buffer_size, callback_state.reentrant_failures,
 +            callback_state.time_info_pair_mismatches, callback_state.time_info_invalid);
++}
++
++static void test_late_callback_recovery(IASIO *driver, LONG buffer_size)
++{
++    ASIOSamples before_position, before_time, after_position, after_time;
++    LONG count = callback_state.plain_callbacks + callback_state.time_callbacks;
++    LONG resyncs = callback_state.resync_notifications, resets = callback_state.reset_notifications;
++    LONG completed = callback_state.delays_completed, error;
++
++    error = driver->lpVtbl->getSamplePosition(driver, &before_position, &before_time);
++    ok(error == ASE_OK, "Pre-stall position failed: %ld.\n", error);
++    if (error != ASE_OK) return;
++    InterlockedExchange(&callback_state.delay_next_callback, 50);
++    ok(wait_for_callbacks(count + 8, 4000), "Callbacks stopped after a delayed host callback.\n");
++    ok(callback_state.delays_completed == completed + 1, "Delayed callback did not complete.\n");
++    ok(callback_state.reset_notifications == resets, "A transient delay requested a full reset.\n");
++    ok(callback_state.resync_notifications > resyncs, "Dropped PCM did not request resync.\n");
++    error = driver->lpVtbl->getSamplePosition(driver, &after_position, &after_time);
++    ok(error == ASE_OK, "Post-stall position failed: %ld.\n", error);
++    if (error == ASE_OK)
++    {
++        ok(samples_value(after_position) > samples_value(before_position) + 8 * buffer_size,
++           "Recovery replayed expired periods or reset the sample position.\n");
++        ok(samples_value(after_time) > samples_value(before_time)
++                && samples_value(after_time) <= query_qpc_nanoseconds() + 5000,
++           "Recovery returned a backward or future timestamp.\n");
++    }
++    ok(!callback_state.time_info_pair_mismatches && !callback_state.time_info_invalid,
++       "Recovery returned invalid or inconsistent callback metadata.\n");
++    ok(!callback_state.bad_indices, "Recovery broke buffer alternation.\n");
 +}
 +
 +static void test_buffers_and_callbacks(IASIO *driver, LONG output_channels)
@@ -3203,6 +3277,8 @@ new file mode 100644
 +    trace("Latency before/after Start: %ld/%ld frames, %ld notifications.\n",
 +            output_latency, stopped_latency, callback_state.latency_notifications);
 +
++    test_late_callback_recovery(driver, buffer_size);
++
 +    error = driver->lpVtbl->getSamplePosition(driver, &final_position, &final_timestamp);
 +    ok(error == ASE_OK, "GetSamplePosition before Stop failed: %ld.\n", error);
 +    ok(error != ASE_OK || (samples_value(final_position) % buffer_size) == 0,
@@ -3292,6 +3368,7 @@ new file mode 100644
 +            if (error == ASE_OK)
 +                validate_callback_clock(sample_rate, buffer_size, FALSE, qpc_before_start,
 +                        qpc_after_start, "Plain");
++            test_late_callback_recovery(driver, buffer_size);
 +            error = driver->lpVtbl->stop(driver);
 +            ok(error == ASE_OK, "Plain callback Stop failed: %ld.\n", error);
 +            started = FALSE;
@@ -5313,7 +5390,7 @@ diff --git a/dlls/protonasio/tests/timeline.c b/dlls/protonasio/tests/timeline.c
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/tests/timeline.c
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,393 @@
 +/* ASIO deadline queue regressions. LGPL-2.1-or-later. */
 +#include <stdint.h>
 +#include <string.h>
@@ -5453,7 +5530,7 @@ new file mode 100644
 +static void test_ticket_time(void)
 +{
 +    struct asio_time_state state = {0};
-+    uint64_t before, after;
++    uint64_t before = 0, after = 0;
 +
 +    /* Captured Q1024 -> Q256: both native clocks advanced, but the ticket regressed. */
 +    ok(audio_presentation_time_at(416256 + 512, 346349315731280ULL,
@@ -5610,6 +5687,42 @@ new file mode 100644
 +    asio_queue_destroy(&queue);
 +}
 +
++static void test_late_recovery(void)
++{
++    struct asio_deadline_queue queue;
++    struct asio_render_result result;
++    uint32_t input[4], output[8];
++    uint64_t id, ns;
++
++    ok(asio_queue_init(&queue, 4, sizeof(*input), 4), "Queue initialization failed.\n");
++    asio_queue_reset(&queue, 7, 0);
++    fill(input, 4, 1);
++    ok(asio_queue_commit(&queue, 7, 0, input) == ASIO_COMMITTED, "Initial commit failed.\n");
++    ok(asio_queue_render(&queue, output, 6, &result), "Stalled producer render failed.\n");
++    ok(asio_queue_commit(&queue, 7, 1, input) == ASIO_LATE, "Late PCM was published.\n");
++    ok(queue.write_index == 1 && queue.last_committed == 0, "Late PCM changed the FIFO.\n");
++    ok(asio_queue_next_block(&queue, 1, &id) && id == 2, "Recovery did not skip the partial block.\n");
++    fill(input, 4, 9);
++    ok(asio_queue_commit(&queue, 7, id, input) == ASIO_COMMITTED, "Recovery commit failed.\n");
++    ok(asio_queue_render(&queue, output, 6, &result), "Recovery render failed.\n");
++    check_samples(output, 2, 0);
++    check_samples(output + 2, 4, 9);
++    ok(result.copied_frames == 4 && result.silent_frames == 2 && queue.generation == 7,
++       "Recovery replayed stale PCM or reset the stream.\n");
++    ok(audio_presentation_time_at(6, 1000000000, 8, 48000, &ns) && ns > 1000000000,
++       "Recovery timestamp did not follow the actual sample position.\n");
++    ok(asio_queue_next_block(&queue, 3, &id) && id == 3, "Exact deadline skipped a valid block.\n");
++    ok(asio_queue_next_block(&queue, 5, &id) && id == 5, "Recovery moved the producer backward.\n");
++    asio_queue_reset(&queue, 8, 3);
++    ok(asio_queue_render(&queue, output, 6, &result), "Offset-origin render failed.\n");
++    ok(asio_queue_next_block(&queue, 0, &id) && id == 1, "Recovery ignored the queue origin.\n");
++    queue.deadline_position = 1000003;
++    ok(asio_queue_next_block(&queue, 1, &id) && id == 250000, "Long stall was not coalesced.\n");
++    queue.deadline_position = UINT64_MAX;
++    ok(!asio_queue_next_block(&queue, 1, &id), "Recovery accepted position overflow.\n");
++    asio_queue_destroy(&queue);
++}
++
 +static void test_origin_wrap_and_generation(void)
 +{
 +    struct asio_deadline_queue queue;
@@ -5662,6 +5775,7 @@ new file mode 100644
 +    test_ticket_lifecycle();
 +    test_ticket_time();
 +    test_partial_and_late();
++    test_late_recovery();
 +    test_origin_wrap_and_generation();
 +}
 +#else
@@ -5674,7 +5788,7 @@ diff --git a/dlls/protonasio/timeline.c b/dlls/protonasio/timeline.c
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/timeline.c
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,239 @@
 +/* ASIO deadline queue. LGPL-2.1-or-later. */
 +#if 0
 +#pragma makedep unix
@@ -5792,6 +5906,23 @@ new file mode 100644
 +    return *position <= UINT64_MAX - queue->block_frames;
 +}
 +
++bool asio_queue_next_block(const struct asio_deadline_queue *queue, uint64_t id, uint64_t *next)
++{
++    uint64_t deadline, elapsed, first;
++
++    if (!queue->block_frames) return false;
++    deadline = __atomic_load_n(&queue->deadline_position, __ATOMIC_ACQUIRE);
++    if (deadline > queue->origin)
++    {
++        elapsed = deadline - queue->origin;
++        first = elapsed / queue->block_frames + !!(elapsed % queue->block_frames);
++        if (id < first) id = first;
++    }
++    if (!asio_queue_block_position(queue, id, &first)) return false;
++    *next = id;
++    return true;
++}
++
 +/* One Windows worker produces complete blocks. The release publishes PCM and id together. */
 +enum asio_commit_result asio_queue_commit(struct asio_deadline_queue *queue, uint64_t generation,
 +                                           uint64_t id, const void *data)
@@ -5901,7 +6032,7 @@ diff --git a/dlls/protonasio/timeline.h b/dlls/protonasio/timeline.h
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/timeline.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +/* ASIO deadline queue. LGPL-2.1-or-later. */
 +#ifndef PROTONASIO_TIMELINE_H
 +#define PROTONASIO_TIMELINE_H
@@ -5973,6 +6104,7 @@ new file mode 100644
 +void asio_queue_reset(struct asio_deadline_queue *, uint64_t, uint64_t);
 +bool asio_block_due(uint64_t, uint64_t, uint32_t);
 +bool asio_queue_block_position(const struct asio_deadline_queue *, uint64_t, uint64_t *);
++bool asio_queue_next_block(const struct asio_deadline_queue *, uint64_t, uint64_t *);
 +enum asio_commit_result asio_queue_commit(struct asio_deadline_queue *, uint64_t, uint64_t,
 +                                           const void *);
 +bool asio_queue_render(struct asio_deadline_queue *, void *, uint32_t,
@@ -5983,14 +6115,16 @@ diff --git a/dlls/protonasio/unixlib.h b/dlls/protonasio/unixlib.h
 new file mode 100644
 --- /dev/null
 +++ b/dlls/protonasio/unixlib.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,30 @@
 +/* Native PipeWire transport. LGPL-2.1-or-later. */
 +#ifndef PROTONASIO_UNIXLIB_H
 +#define PROTONASIO_UNIXLIB_H
 +#include "windef.h"
 +#include "wine/unixlib.h"
 +
-+#define ASIO_UNIX_ABI 0x50415333u
++#define ASIO_UNIX_ABI 0x50415334u
++
++enum { ASIO_WRITE_DROPPED = 1 };
 +
 +enum asio_unix_call { asio_open, asio_close, asio_create, asio_destroy, asio_start,
 +                     asio_stop, asio_wait, asio_write, asio_timing, asio_reset,
