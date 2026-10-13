@@ -1389,6 +1389,14 @@ class CompatData:
             setup_steam_dir_drive()
             setup_openvr_paths()
 
+            if g_session.run_proc([g_proton.wine_bin, "C:\\windows\\system32\\regsvr32.exe",
+                                   "/s", "protonasio.dll"]):
+                log("warning: unable to configure Proton-BM ASIO registration; continuing launch")
+            else:
+                asio_marker = self.path("proton_asio")
+                if os.path.exists(asio_marker):
+                    os.unlink(asio_marker)
+
     def sync_appcache(self):
         sgi = os.environ.get('SteamGameId', '')
         if sgi == '':
