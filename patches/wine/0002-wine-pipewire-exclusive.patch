@@ -1,8 +1,12 @@
 diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
-index 29481de8e751..6922d4c25bbb 100644
 --- a/dlls/mmdevapi/client.c
 +++ b/dlls/mmdevapi/client.c
-@@ -166,10 +166,6 @@
+@@ -163,13 +163,11 @@
+                 return AUDCLNT_E_INVALID_DEVICE_PERIOD;
+             else if (*duration > 20000000) /* The smaller the period, the lower this limit. */
+                 return AUDCLNT_E_BUFFER_SIZE_ERROR;
++            if (flags & AUDCLNT_STREAMFLAGS_RATEADJUST)
++                return AUDCLNT_E_UNSUPPORTED_FORMAT;
              else if (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
                  if (*duration != *period)
                      return AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL;
@@ -14,24 +18,24 @@ index 29481de8e751..6922d4c25bbb 100644
                  *duration = 8 * *period; /* May grow above 2s. */
          }
 diff --git a/dlls/mmdevapi/tests/Makefile.in b/dlls/mmdevapi/tests/Makefile.in
-index dc515833ce19..9132364f070c 100644
 --- a/dlls/mmdevapi/tests/Makefile.in
 +++ b/dlls/mmdevapi/tests/Makefile.in
-@@ -4,6 +4,8 @@
+@@ -4,7 +4,10 @@
  SOURCES = \
  	capture.c \
  	dependency.c \
 +	exclusive.c \
 +	exclusive_shared.c \
  	mmdevenum.c \
++	presentation.c \
  	propstore.c \
  	render.c \
+ 	spatialaudio.c
 diff --git a/dlls/mmdevapi/tests/exclusive.c b/dlls/mmdevapi/tests/exclusive.c
 new file mode 100644
-index 000000000000..e1d53fc6b11b
 --- /dev/null
 +++ b/dlls/mmdevapi/tests/exclusive.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,388 @@
 +/*
 + * Event-driven exclusive render streams.
 + *
@@ -44,6 +48,7 @@ index 000000000000..e1d53fc6b11b
 +#define COBJMACROS
 +#include <io.h>
 +#include <math.h>
++#include <stdint.h>
 +#include "windows.h"
 +#include "wine/test.h"
 +#ifdef STANDALONE
@@ -51,20 +56,72 @@ index 000000000000..e1d53fc6b11b
 +#endif
 +#include "mmdeviceapi.h"
 +#include "audioclient.h"
++#include "../../winepipewire.drv/recovery.h"
 +
-+static void test_exclusive_event(IMMDevice *device, UINT rate, WORD tag)
++static void test_quantum_recovery_retries(void)
++{
++    struct wine_pipewire_recovery state = {1};
++    uint64_t now = 1000000000;
++    unsigned int i;
++
++    for (i = 0; i < 3; ++i)
++    {
++        state.connecting = 1;
++        state.ready = 1;
++        ok(wine_pipewire_recovery_failed(&state, now), "Failure %u escaped early.\n", i + 1);
++        ok(state.pending && state.failures == i + 1 && !state.connecting && !state.ready,
++           "Retry %u has invalid state.\n", i + 1);
++        ok(state.due_ns == now + (UINT64_C(100000000) << i),
++           "Retry %u did not back off.\n", i + 1);
++        now = state.due_ns;
++    }
++    ok(!wine_pipewire_recovery_failed(&state, now), "Fourth failure did not invalidate.\n");
++    ok(!state.pending && state.failures == 4, "Terminal failure state is incorrect.\n");
++
++    state.pending = 1;
++    state.ready = 1;
++    wine_pipewire_recovery_complete(&state);
++    ok(!state.pending && !state.failures && !state.connecting && !state.due_ns && !state.ready,
++       "Success did not clear consecutive failures.\n");
++    state.pending = 1;
++    ok(wine_pipewire_recovery_failed(&state, now) && state.failures == 1 && state.pending,
++       "A later disruption inherited the previous failures.\n");
++    ok(state.due_ns == now + 100000000, "A later disruption inherited the old backoff.\n");
++}
++
++static UINT64 qpc_to_hns(const LARGE_INTEGER *value, const LARGE_INTEGER *frequency)
++{
++    UINT64 qpc, freq, whole, remainder;
++
++    if (!value || !frequency || value->QuadPart < 0 || frequency->QuadPart <= 0)
++        return 0;
++    qpc = (UINT64)value->QuadPart;
++    freq = (UINT64)frequency->QuadPart;
++    whole = qpc / freq;
++    remainder = qpc % freq;
++    return whole * 10000000 + remainder * 10000000 / freq;
++}
++
++static void test_exclusive_event(IMMDevice *device, UINT rate, WORD tag, UINT buffer_frames)
 +{
 +    WAVEFORMATEX format = {tag, 2, rate};
 +    IAudioRenderClient *render = NULL;
 +    IAudioClock *clock = NULL;
++    IAudioClock2 *clock2 = NULL;
++    IAudioClockAdjustment *adjustment = NULL;
 +    IAudioClient *client;
 +    REFERENCE_TIME period;
 +    UINT32 frames, padding, i, j;
-+    UINT64 frequency, position, qpctime;
++    UINT64 frequency, position, qpctime, max_queued_frames, expected_position;
++    UINT64 device_position, device_qpctime, stopped_position, stopped_qpctime;
++    UINT64 stopped_position2, stopped_qpctime2;
++    UINT64 resumed_position, resumed_qpctime;
 +    LARGE_INTEGER qpc_before, qpc_after, qpc_frequency = {0};
++    LARGE_INTEGER qpc_query_before, qpc_query_after;
 +    HANDLE event = NULL;
 +    BYTE *data;
-+    HRESULT hr;
++    REFERENCE_TIME latency, initial_latency;
++    HRESULT hr, clock_hr;
 +    double phase = 0.0;
 +
 +    format.wBitsPerSample = tag == WAVE_FORMAT_PCM ? 16 : 32;
@@ -85,7 +142,23 @@ index 000000000000..e1d53fc6b11b
 +    hr = IAudioClient_GetDevicePeriod(client, NULL, &period);
 +    ok(hr == S_OK, "GetDevicePeriod failed: %#lx.\n", hr);
 +    if (FAILED(hr)) goto done;
++    if (buffer_frames)
++    {
++        REFERENCE_TIME requested = (UINT64)buffer_frames * 10000000 / rate;
 +
++        if (requested < period)
++        {
++            skip("The device minimum period exceeds %u frames at %u Hz.\n", buffer_frames, rate);
++            goto done;
++        }
++        period = requested;
++    }
++
++    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_EXCLUSIVE,
++                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_RATEADJUST,
++                                period, period, &format, NULL);
++    ok(hr == AUDCLNT_E_UNSUPPORTED_FORMAT,
++       "Exclusive RATEADJUST Initialize returned %#lx.\n", hr);
 +    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 +                                period + 1, period, &format, NULL);
 +    ok(hr == AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL, "Unequal periods returned %#lx.\n", hr);
@@ -108,6 +181,18 @@ index 000000000000..e1d53fc6b11b
 +    hr = IAudioClock_GetFrequency(clock, &frequency);
 +    ok(hr == S_OK && frequency == rate, "Frequency %#lx, %I64u, expected %u.\n",
 +       hr, frequency, rate);
++    hr = IAudioClient_GetService(client, &IID_IAudioClockAdjustment, (void **)&adjustment);
++    if (SUCCEEDED(hr))
++    {
++        hr = IAudioClockAdjustment_SetSampleRate(adjustment, rate / 2.0f);
++        ok(FAILED(hr), "Exclusive SetSampleRate succeeded: %#lx.\n", hr);
++        IAudioClockAdjustment_Release(adjustment);
++        adjustment = NULL;
++    }
++    hr = IAudioClient_GetStreamLatency(client, &latency);
++    ok(hr == S_OK && latency > 0, "GetStreamLatency before Start failed: %#lx, %I64d.\n",
++       hr, latency);
++    initial_latency = latency;
 +
 +    hr = IAudioRenderClient_GetBuffer(render, frames - 1, &data);
 +    ok(hr == AUDCLNT_E_BUFFER_SIZE_ERROR, "Partial GetBuffer returned %#lx.\n", hr);
@@ -120,6 +205,10 @@ index 000000000000..e1d53fc6b11b
 +    ok(hr == AUDCLNT_E_BUFFER_SIZE_ERROR, "Empty ReleaseBuffer returned %#lx.\n", hr);
 +    hr = IAudioRenderClient_ReleaseBuffer(render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
 +    ok(hr == S_OK, "ReleaseBuffer failed: %#lx.\n", hr);
++    hr = IAudioClock_GetPosition(clock, &position, &qpctime);
++    ok(hr == S_OK || hr == S_FALSE, "Pre-start GetPosition failed: %#lx.\n", hr);
++    ok(!position && qpctime, "Pre-start position/QPC pair was not zero/current: %I64u, %I64u.\n",
++       position, qpctime);
 +    hr = IAudioClient_Start(client);
 +    ok(hr == AUDCLNT_E_EVENTHANDLE_NOT_SET, "Start without an event returned %#lx.\n", hr);
 +
@@ -131,6 +220,12 @@ index 000000000000..e1d53fc6b11b
 +    hr = IAudioClient_Start(client);
 +    ok(hr == S_OK, "Start failed: %#lx.\n", hr);
 +    if (FAILED(hr)) goto done;
++    hr = IAudioClient_GetStreamLatency(client, &latency);
++    ok(hr == S_OK && latency == initial_latency,
++       "GetStreamLatency changed at Start: %#lx, %I64d != %I64d.\n",
++       hr, latency, initial_latency);
++    ok(QueryPerformanceFrequency(&qpc_frequency), "QueryPerformanceFrequency failed.\n");
++    QueryPerformanceCounter(&qpc_before);
 +    for (i = 0; i < 64; ++i)
 +    {
 +        DWORD wait = WaitForSingleObject(event, 1000);
@@ -157,23 +252,119 @@ index 000000000000..e1d53fc6b11b
 +        hr = IAudioRenderClient_ReleaseBuffer(render, frames, winetest_interactive ? 0 : AUDCLNT_BUFFERFLAGS_SILENT);
 +        ok(hr == S_OK, "Full-buffer ReleaseBuffer at event %u: %#lx.\n", i, hr);
 +    }
-+    ok(QueryPerformanceFrequency(&qpc_frequency), "QueryPerformanceFrequency failed.\n");
-+    QueryPerformanceCounter(&qpc_before);
-+    hr = IAudioClock_GetPosition(clock, &position, &qpctime);
 +    QueryPerformanceCounter(&qpc_after);
++    if (i == 64 && qpc_frequency.QuadPart > 0)
++    {
++        UINT64 elapsed_hns = ((UINT64)(qpc_after.QuadPart - qpc_before.QuadPart) * 10000000)
++                / qpc_frequency.QuadPart;
++        UINT64 expected_hns = (UINT64)i * period;
++        UINT64 limit_hns = expected_hns + expected_hns / 2 + 1000000;
++
++        ok(elapsed_hns <= limit_hns,
++           "Exclusive event throughput is below the API period: %I64u hns for %u events, expected <= %I64u.\n",
++           elapsed_hns, i, limit_hns);
++    }
++    QueryPerformanceCounter(&qpc_query_before);
++    hr = IAudioClock_GetPosition(clock, &position, &qpctime);
++    QueryPerformanceCounter(&qpc_query_after);
++    clock_hr = hr;
++    ok(hr == S_OK || hr == S_FALSE, "GetPosition failed: %#lx.\n", hr);
++    ok(qpctime, "GetPosition returned no correlated QPC: %#lx.\n", hr);
 +    if (hr == S_OK && qpc_frequency.QuadPart > 0)
-+        ok(qpctime / 10000000.0 >= qpc_before.QuadPart / (double)qpc_frequency.QuadPart - 0.1
-+                && qpctime / 10000000.0 <= qpc_after.QuadPart / (double)qpc_frequency.QuadPart + 0.1,
-+                "Clock QPC %I64u is outside the current performance-counter interval.\n", qpctime);
-+    ok(hr == S_OK && position >= (UINT64)frames * (i > 1 ? i - 1 : 0) &&
++    {
++        UINT64 query_before_hns = qpc_to_hns(&qpc_query_before, &qpc_frequency);
++        UINT64 query_after_hns = qpc_to_hns(&qpc_query_after, &qpc_frequency);
++        UINT64 tolerance_hns = initial_latency > 500000 ? (UINT64)initial_latency : 500000;
++
++        ok(qpctime <= query_after_hns + tolerance_hns,
++           "GetPosition QPC is in the future: %I64u > %I64u.\n",
++           qpctime, query_after_hns + tolerance_hns);
++        ok(qpctime + tolerance_hns >= query_before_hns,
++           "GetPosition QPC is too old for S_OK: %I64u < %I64u.\n",
++           qpctime, query_before_hns - tolerance_hns);
++    }
++    hr = IAudioClock_QueryInterface(clock, &IID_IAudioClock2, (void **)&clock2);
++    ok(hr == S_OK, "IAudioClock2 is unavailable: %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IAudioClock2_GetPosition(clock2, &device_position, &device_qpctime);
++        ok(hr == S_OK || hr == S_FALSE, "IAudioClock2_GetPosition failed: %#lx.\n", hr);
++        if (hr == S_OK || hr == S_FALSE)
++        {
++            ok(device_position <= (UINT64)frames * (i + 1),
++               "Device clock position is out of range: %I64u, %u events.\n", device_position, i);
++            ok(device_qpctime, "IAudioClock2 returned no correlated QPC: %#lx.\n", hr);
++        }
++        IAudioClock2_Release(clock2);
++        clock2 = NULL;
++    }
++    hr = IAudioClient_GetStreamLatency(client, &latency);
++    ok(hr == S_OK && latency == initial_latency,
++       "GetStreamLatency changed during playback: %#lx, %I64d != %I64d.\n",
++       hr, latency, initial_latency);
++    if (SUCCEEDED(hr) && latency >= 0 &&
++        (UINT64)latency <= (UINT64_MAX - 9999999) / rate)
++        max_queued_frames = ((UINT64)latency * rate + 9999999) / 10000000;
++    else
++        max_queued_frames = (UINT64)frames * 2;
++    if (max_queued_frames < frames)
++        max_queued_frames = frames;
++    expected_position = (UINT64)frames * (i > 1 ? i - 1 : 0);
++    if (expected_position > max_queued_frames)
++        expected_position -= max_queued_frames;
++    else
++        expected_position = 0;
++    ok((clock_hr == S_OK || clock_hr == S_FALSE) && position >= expected_position &&
 +       position <= (UINT64)frames * (i + 1),
-+       "Clock did not advance with buffers: %#lx, %I64u, %u events.\n", hr, position, i);
++       "Clock did not advance with buffers: %#lx, %I64u, %u events.\n", clock_hr, position, i);
 +    hr = IAudioClient_Stop(client);
 +    ok(hr == S_OK, "Stop failed: %#lx.\n", hr);
++    hr = IAudioClock_GetPosition(clock, &stopped_position, &stopped_qpctime);
++    ok(hr == S_OK || hr == S_FALSE, "Stopped GetPosition failed: %#lx.\n", hr);
++    hr = IAudioClock_GetPosition(clock, &stopped_position2, &stopped_qpctime2);
++    ok(hr == S_OK || hr == S_FALSE, "Repeated stopped GetPosition failed: %#lx.\n", hr);
++    ok(stopped_position2 == stopped_position && stopped_qpctime2 == stopped_qpctime,
++       "Stopped position/QPC pair changed: %I64u/%I64u -> %I64u/%I64u.\n",
++       stopped_position, stopped_qpctime, stopped_position2, stopped_qpctime2);
++
++    /* Stop must preserve the accepted stream timeline.  Restart this same
++     * client without Reset and verify its clock resumes advancing while the
++     * source/public coordinate mapping remains intact. */
++    ResetEvent(event);
++    hr = IAudioClient_Start(client);
++    ok(hr == S_OK, "Start without Reset failed: %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        for (j = 0; j < 8; ++j)
++        {
++            ok(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0,
++               "Restart without Reset did not signal readiness.\n");
++            hr = IAudioRenderClient_GetBuffer(render, frames, &data);
++            ok(hr == S_OK, "Resumed GetBuffer failed: %#lx.\n", hr);
++            if (FAILED(hr)) break;
++            hr = IAudioRenderClient_ReleaseBuffer(render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
++            ok(hr == S_OK, "Resumed ReleaseBuffer failed: %#lx.\n", hr);
++        }
++        hr = IAudioClock_GetPosition(clock, &resumed_position, &resumed_qpctime);
++        ok(hr == S_OK, "Resumed GetPosition did not recover: %#lx.\n", hr);
++        ok(resumed_position > stopped_position && resumed_qpctime > stopped_qpctime,
++           "Resumed clock remained frozen: %I64u/%I64u -> %I64u/%I64u.\n",
++           stopped_position, stopped_qpctime, resumed_position, resumed_qpctime);
++        hr = IAudioClient_Stop(client);
++        ok(hr == S_OK, "Stop after restart without Reset failed: %#lx.\n", hr);
++    }
++    hr = IAudioClient_GetStreamLatency(client, &latency);
++    ok(hr == S_OK && latency == initial_latency,
++       "GetStreamLatency changed at Stop: %#lx, %I64d != %I64d.\n",
++       hr, latency, initial_latency);
 +    ResetEvent(event);
 +    ok(WaitForSingleObject(event, 50) == WAIT_TIMEOUT, "Stopped stream signalled its event.\n");
 +    hr = IAudioClient_Reset(client);
 +    ok(hr == S_OK, "Reset failed: %#lx.\n", hr);
++    hr = IAudioClient_GetStreamLatency(client, &latency);
++    ok(hr == S_OK && latency == initial_latency,
++       "GetStreamLatency changed at Reset: %#lx, %I64d != %I64d.\n",
++       hr, latency, initial_latency);
 +    hr = IAudioClient_GetCurrentPadding(client, &padding);
 +    ok(hr == S_OK && !padding, "Padding after reset: %#lx, %u.\n", hr, padding);
 +    ResetEvent(event);
@@ -181,6 +372,10 @@ index 000000000000..e1d53fc6b11b
 +    ok(hr == S_OK, "Empty-buffer Start failed: %#lx.\n", hr);
 +    if (SUCCEEDED(hr))
 +    {
++        hr = IAudioClient_GetStreamLatency(client, &latency);
++        ok(hr == S_OK && latency == initial_latency,
++           "GetStreamLatency changed at restart: %#lx, %I64d != %I64d.\n",
++           hr, latency, initial_latency);
 +        ok(WaitForSingleObject(event, 1000) == WAIT_OBJECT_0, "Empty stream did not signal readiness.\n");
 +        hr = IAudioRenderClient_GetBuffer(render, frames, &data);
 +        ok(hr == S_OK, "Empty-stream GetBuffer failed: %#lx.\n", hr);
@@ -193,6 +388,8 @@ index 000000000000..e1d53fc6b11b
 +done:
 +    IAudioClient_Stop(client);
 +    if (clock) IAudioClock_Release(clock);
++    if (clock2) IAudioClock2_Release(clock2);
++    if (adjustment) IAudioClockAdjustment_Release(adjustment);
 +    if (render) IAudioRenderClient_Release(render);
 +    IAudioClient_Release(client);
 +    if (event) CloseHandle(event);
@@ -204,6 +401,7 @@ index 000000000000..e1d53fc6b11b
 +    IMMDevice *device;
 +    HRESULT hr;
 +
++    test_quantum_recovery_retries();
 +    CoInitialize(NULL);
 +    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
 +                         &IID_IMMDeviceEnumerator, (void **)&enumerator);
@@ -213,10 +411,12 @@ index 000000000000..e1d53fc6b11b
 +        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &device);
 +        if (SUCCEEDED(hr))
 +        {
-+            test_exclusive_event(device, 44100, WAVE_FORMAT_PCM);
-+            test_exclusive_event(device, 48000, WAVE_FORMAT_PCM);
-+            test_exclusive_event(device, 44100, WAVE_FORMAT_IEEE_FLOAT);
-+            test_exclusive_event(device, 48000, WAVE_FORMAT_IEEE_FLOAT);
++            test_exclusive_event(device, 44100, WAVE_FORMAT_PCM, 0);
++            test_exclusive_event(device, 48000, WAVE_FORMAT_PCM, 0);
++            test_exclusive_event(device, 44100, WAVE_FORMAT_IEEE_FLOAT, 0);
++            test_exclusive_event(device, 48000, WAVE_FORMAT_IEEE_FLOAT, 0);
++            /* SRC startup can request more than one client period at a tight graph bound. */
++            test_exclusive_event(device, 44100, WAVE_FORMAT_PCM, 256);
 +            IMMDevice_Release(device);
 +        }
 +        else skip("No render endpoint: %#lx.\n", hr);
@@ -226,7 +426,6 @@ index 000000000000..e1d53fc6b11b
 +}
 diff --git a/dlls/mmdevapi/tests/exclusive_shared.c b/dlls/mmdevapi/tests/exclusive_shared.c
 new file mode 100644
-index 000000000000..c07b11e1cb56
 --- /dev/null
 +++ b/dlls/mmdevapi/tests/exclusive_shared.c
 @@ -0,0 +1,504 @@
@@ -734,31 +933,378 @@ index 000000000000..c07b11e1cb56
 +    if (enumerator) IMMDeviceEnumerator_Release(enumerator);
 +    CoUninitialize();
 +}
+diff --git a/dlls/mmdevapi/tests/presentation.c b/dlls/mmdevapi/tests/presentation.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/mmdevapi/tests/presentation.c
+@@ -0,0 +1,269 @@
++/* PipeWire presentation timeline regressions. */
++
++#include <stdint.h>
++#include <limits.h>
++#include "wine/test.h"
++
++/* Exercise the production Unix adapter math on both PE architectures. */
++#include "../../winepipewire.drv/presentation.c"
++
++static void test_first_sample_and_pending(void)
++{
++    const struct wine_presentation_observation phase = {
++        1000000000, 256, 0, 480, 1, 48000, 48000
++    };
++    const struct wine_presentation_observation combined = {
++        1000000000, 1, 1, 0, 1, 1, 44100
++    };
++    struct wine_presentation_observation observation = {
++        1000000000, 512, 224, 0, 1, 1, 48000
++    };
++    struct wine_presentation_basis startup = {
++        1, 256, 512, 0, 0, 1015333333, 1020666666, 48000
++    };
++    uint64_t first = 0, end = 0, position = 0;
++
++    ok(wine_presentation_first_ns(&phase, &first), "Phase first-sample time failed.\n");
++    ok(first == 1015333333, "Phase T0 is %I64u, expected 1015333333.\n", first);
++    ok(wine_presentation_span_end(first, 256, 48000, &end), "Phase span end failed.\n");
++    ok(end == 1020666666, "Phase span end is %I64u, expected 1020666666.\n", end);
++    ok(wine_presentation_first_ns(&combined, &first), "Combined backlog T0 failed.\n");
++    ok(first == 1000045351, "Combined backlog T0 is %I64u, expected 1000045351.\n", first);
++
++    ok(wine_presentation_first_ns(&observation, &first), "First-sample time failed.\n");
++    ok(first == 1015333333, "Pending 736-frame T0 is %I64u, expected 1015333333.\n", first);
++    ok(wine_presentation_span_end(first, 256, 48000, &end), "Span end failed.\n");
++    ok(end == 1020666666, "Span end is %I64u, expected 1020666666.\n", end);
++
++    ok(wine_presentation_project_basis(&startup, 1000000000, &position),
++       "Startup projection failed.\n");
++    ok(position == 0, "Startup position escaped early: %I64u.\n", position);
++    ok(wine_presentation_project_basis(&startup, 1010000000, &position),
++       "Startup boundary projection failed.\n");
++    ok(position == 0, "Position advanced before the first sample: %I64u.\n", position);
++    ok(wine_presentation_project_basis(&startup, 1012000000, &position),
++       "Startup middle projection failed.\n");
++    ok(position == 96, "Startup middle position is %I64u, expected 96.\n", position);
++    ok(wine_presentation_project_basis(&startup, 1015333333, &position),
++       "Startup first-sample projection failed.\n");
++    ok(position == 256, "Startup first-sample position is %I64u, expected 256.\n", position);
++}
++
++static void test_retained_resume_origin(void)
++{
++    /* Stop froze public P=768 while native [768,1024) remained queued. */
++    const struct wine_presentation_basis basis = {
++        2, 1024, 1280, 768, 768, 7005333333, 7010666666, 48000
++    };
++    uint64_t position = 0;
++
++    ok(wine_presentation_project_basis(&basis, 7000000000, &position),
++       "Long-pause projection failed.\n");
++    ok(position == 768, "Long-pause position is %I64u, expected 768.\n", position);
++    ok(wine_presentation_project_basis(&basis, 7002666667, &position),
++       "Retained middle projection failed.\n");
++    ok(position == 896, "Retained middle position is %I64u, expected 896.\n", position);
++    ok(wine_presentation_project_basis(&basis, 7005333333, &position),
++       "Retained end projection failed.\n");
++    ok(position == 1024, "Retained end position is %I64u, expected 1024.\n", position);
++    ok(wine_presentation_project_basis(&basis, 7010666666, &position),
++       "Resumed submission projection failed.\n");
++    ok(position == 1280, "Resumed submission position is %I64u, expected 1280.\n", position);
++}
++
++static void test_resume_origin_selection(void)
++{
++    struct wine_presentation_basis discarded = {
++        3, 1024, 1280, 1024, 768, 7000000000, 7005333333, 48000
++    };
++    uint64_t origin = 0, position = 0;
++
++    ok(wine_presentation_resume_origin(1024, 256, 0, &origin),
++       "Retained native origin calculation failed.\n");
++    ok(origin == 768, "Retained native origin is %I64u, expected 768.\n", origin);
++    ok(wine_presentation_resume_origin(1024, 128, 128, &origin),
++       "Queued plus converter origin calculation failed.\n");
++    ok(origin == 768, "Queued plus converter origin is %I64u, expected 768.\n", origin);
++    ok(wine_presentation_resume_origin(1024, 0, 0, &origin),
++       "Empty native origin calculation failed.\n");
++    ok(origin == 1024, "Empty native origin is %I64u, expected 1024.\n", origin);
++    ok(!wine_presentation_resume_origin(1024, 1025, 0, &origin),
++       "Over-retained native queue was accepted.\n");
++    ok(!wine_presentation_resume_origin(UINT64_MAX, UINT64_MAX, 1, &origin),
++       "Native queue arithmetic overflow was accepted.\n");
++    ok(wine_presentation_project_basis(&discarded, 7000000000, &position),
++       "Discarded native origin projection failed.\n");
++    ok(position == 768, "Discarded native origin position is %I64u, expected 768.\n", position);
++    ok(wine_presentation_project_basis(&discarded, 7005333333, &position),
++       "Discarded submission projection failed.\n");
++    ok(position == 1024, "Discarded submission position is %I64u, expected 1024.\n", position);
++}
++
++static void test_resume_source_mapping(void)
++{
++    uint64_t origin;
++
++    /* Measured Stop position was 15324, but the retained source began at 15523. */
++    ok(wine_presentation_reanchor(0, 0, 15523, &origin) && origin == 15523,
++       "Resume replaced the retained source coordinate with the frozen position.\n");
++    ok(wine_presentation_reanchor(15523, origin, 31753, &origin) && origin == 31753,
++       "Repeated Stop/Resume accumulated a clock phase offset.\n");
++    ok(wine_presentation_reanchor(100, 70, 180, &origin) && origin == 150,
++       "Resume lost the existing source/public offset.\n");
++    ok(wine_presentation_reanchor(100, 70, 100, &origin) && origin == 70,
++       "An empty resume extent changed the public coordinate.\n");
++    ok(!wine_presentation_reanchor(100, 70, 99, &origin),
++       "A regressing retained frontier was accepted.\n");
++    ok(!wine_presentation_reanchor(0, UINT64_MAX, 1, &origin),
++       "A wrapped public origin was accepted.\n");
++    ok(!wine_presentation_reanchor(0, 0, 0, NULL), "A missing public origin was accepted.\n");
++}
++
++static void test_undersupply_projection(void)
++{
++    const struct wine_presentation_basis basis = {
++        1, 0, 1024, 0, 0, 2010666666, 2031999999, 48000
++    };
++    const struct wine_presentation_basis one_span = {
++        1, 0, 256, 0, 0, 1015333333, 1020666666, 48000
++    };
++    uint64_t position = 0;
++
++    ok(wine_presentation_project_basis(&basis, 2000000000, &position),
++       "Undersupply basis projection failed.\n");
++    ok(position == 0, "Undersupply basis position is %I64u, expected 0.\n", position);
++    ok(wine_presentation_project_basis(&basis, 2031999999, &position),
++       "Undersupply end projection failed.\n");
++    ok(position == 1024, "Undersupply end position is %I64u, expected 1024.\n", position);
++    ok(wine_presentation_project_basis(&one_span, 1020000000, &position),
++       "One-span middle projection failed.\n");
++    ok(position == 224, "One-span middle position is %I64u, expected 224.\n", position);
++}
++
++static void test_adjacent_sizes(void)
++{
++    const struct wine_presentation_observation previous = {
++        1000000000, 0, 0, 0, 1, 48000, 48000
++    };
++    struct wine_presentation_observation same = previous;
++    struct wine_presentation_observation fresh = previous;
++    uint64_t first_a = 0, first_b = 0, end_a = 0, end_b = 0;
++
++    ok(wine_presentation_first_ns(&previous, &first_a), "A first-sample time failed.\n");
++    ok(wine_presentation_span_end(first_a, 256, 48000, &end_a), "A span end failed.\n");
++    ok(wine_presentation_first_ns(&same, &first_b), "Stale B first-sample time failed.\n");
++    ok(!wine_presentation_span_contiguous(&previous, &same, end_a, first_b),
++       "A256/B128 same snapshot was treated as adjacent.\n");
++    fresh.queued_frames = 256;
++    ok(wine_presentation_first_ns(&fresh, &first_b), "Fresh B first-sample time failed.\n");
++    ok(first_b == end_a, "Fresh B starts at %I64u, expected %I64u.\n", first_b, end_a);
++    ok(wine_presentation_span_contiguous(&previous, &fresh, end_a, first_b),
++       "Fresh A256/B128 snapshot was rejected.\n");
++    ok(wine_presentation_span_end(first_b, 128, 48000, &end_b), "B span end failed.\n");
++    ok(end_b == 1007999999, "B span end is %I64u, expected 1007999999.\n", end_b);
++    ok(wine_presentation_span_contiguous(&previous, &same, end_a, end_a - 1),
++       "One-frame rounding was rejected.\n");
++    same.now_ns++;
++    ok(wine_presentation_span_contiguous(&previous, &same, end_a, end_a - 1),
++       "One-frame graph drift was rejected.\n");
++    same.now_ns -= 2;
++    ok(!wine_presentation_span_contiguous(&previous, &same, end_a, end_a - 1),
++       "Backwards graph time was accepted.\n");
++}
++
++static void test_measured_startup_overlap(void)
++{
++    const struct wine_presentation_observation previous = {
++        1000000000, 0, 0, 0, 1, 48000, 44100
++    };
++    struct wine_presentation_observation current = previous;
++    struct wine_presentation_basis basis;
++    uint64_t first = 0, previous_end = 0, current_first = 0, current_end = 0, position = 0;
++
++    ok(wine_presentation_first_ns(&previous, &first), "Measured A T0 failed.\n");
++    ok(wine_presentation_span_end(first, 256, 44100, &previous_end),
++       "Measured A end failed.\n");
++    /* Native q256/44.1k resampler records observed a -607709 ns startup
++     * transition.  One frame is only 22676 ns, so this is uncertainty, not
++     * an adjacency proof. */
++    current.now_ns = 1001000000;
++    current_first = previous_end - 607709;
++    ok(!wine_presentation_span_contiguous(&previous, &current, previous_end, current_first),
++       "Measured startup overlap was not classified uncertain.\n");
++    ok(wine_presentation_span_end(current_first, 256, 44100, &current_end),
++       "Measured B end failed.\n");
++    basis.epoch = 1;
++    basis.submit_start = 256;
++    basis.submit_end = 512;
++    basis.native_origin = 0;
++    basis.public_origin = 0;
++    basis.first_ns = current_first;
++    basis.end_ns = current_end;
++    basis.stream_rate = 44100;
++    ok(wine_presentation_project_basis(&basis, current_first, &position),
++       "Measured uncertain basis became a fatal projection error.\n");
++    ok(position == 256, "Measured uncertain basis projected %I64u, expected 256.\n", position);
++}
++
++static void test_wide_arithmetic(void)
++{
++    uint64_t value = 0;
++
++    ok(mul_div_u64(UINT64_MAX, UINT32_MAX, UINT32_MAX, &value) && value == UINT64_MAX,
++       "Exact maximum scale failed.\n");
++    ok(mul_div_u64_ceil(UINT64_MAX, UINT32_MAX, UINT32_MAX, &value) && value == UINT64_MAX,
++       "Exact maximum ceiling failed.\n");
++    ok(mul_div_u64(UINT64_MAX - 1, 2, 3, &value) && value == 12297829382473034409ULL,
++       "Wide floor failed.\n");
++    ok(mul_div_u64_ceil(UINT64_MAX - 1, 2, 3, &value) && value == 12297829382473034410ULL,
++       "Wide ceiling failed.\n");
++    ok(mul_div_u64(13176245766935394011ULL, 7, 5, &value) && value == UINT64_MAX,
++       "Fractional maximum floor failed.\n");
++    ok(!mul_div_u64_ceil(13176245766935394011ULL, 7, 5, &value),
++       "Fractional maximum ceiling overflow was accepted.\n");
++    ok(!mul_div_u64(UINT64_MAX, 2, 1, &value), "Product overflow was accepted.\n");
++    ok(!mul_div_u64(1, 1, 0, &value), "A zero divisor was accepted.\n");
++    ok(audio_presentation_first_ns(1000000000, UINT64_MAX, 1, INT64_MIN,
++                                   UINT32_MAX, UINT32_MAX, 2, &value) && value == 1000000000,
++       "Wide pending and negative delay cancellation failed.\n");
++    ok(audio_presentation_first_ns(1000000000, 1, 0, -1, 1, 3, 3, &value)
++       && value == 1000000000, "Signed fractional cancellation failed.\n");
++    ok(audio_presentation_time_at(UINT64_MAX, UINT64_MAX, UINT64_MAX - 1, 1000000000,
++                                  &value) && value == UINT64_MAX - 1,
++       "Timestamp subtraction at the upper bound failed.\n");
++    ok(!audio_presentation_time_at(UINT64_MAX, 1, 0, 1, &value),
++       "A wide negative timestamp was accepted.\n");
++}
++
++static void test_checked_overflow(void)
++{
++    struct wine_presentation_observation observation = {
++        1, UINT64_MAX, UINT64_MAX, 0, 1, 1, 1
++    };
++    struct wine_presentation_basis basis = {
++        1, 0, 1, 0, UINT64_MAX, 1, 2, 48000
++    };
++    uint64_t value = 0;
++
++    ok(!wine_presentation_first_ns(&observation, &value), "T0 overflow was accepted.\n");
++    ok(!wine_presentation_span_end(UINT64_MAX, 1, 48000, &value),
++       "Span timestamp overflow was accepted.\n");
++    ok(!wine_presentation_project_basis(&basis, 2, &value),
++       "Public position overflow was accepted.\n");
++    basis.native_origin = 1;
++    ok(!wine_presentation_project_basis(&basis, 1, &value),
++       "Invalid native origin was accepted.\n");
++}
++
++START_TEST(presentation)
++{
++    test_first_sample_and_pending();
++    test_retained_resume_origin();
++    test_resume_origin_selection();
++    test_resume_source_mapping();
++    test_undersupply_projection();
++    test_adjacent_sizes();
++    test_measured_startup_overlap();
++    test_wide_arithmetic();
++    test_checked_overflow();
++}
+diff --git a/dlls/winepipewire.drv/Makefile.in b/dlls/winepipewire.drv/Makefile.in
+--- a/dlls/winepipewire.drv/Makefile.in
++++ b/dlls/winepipewire.drv/Makefile.in
+@@ -3,4 +3,5 @@
+ UNIX_CFLAGS  = $(PIPEWIRE_CFLAGS)
+ 
+ SOURCES = \
+-	pipewire.c
++	pipewire.c \
++	presentation.c
 diff --git a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
-index cae9879f234c..1b37f7a4a302 100644
 --- a/dlls/winepipewire.drv/pipewire.c
 +++ b/dlls/winepipewire.drv/pipewire.c
-@@ -88,6 +88,7 @@
+@@ -53,6 +53,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <pthread.h>
++#include <sched.h>
+ #include <time.h>
+ #include <dlfcn.h>
+ #include <limits.h>
+@@ -68,6 +69,7 @@
+ #include <spa/param/param.h>
+ #include <spa/param/props.h>
+ #include <spa/param/audio/format-utils.h>
++#include <spa/node/io.h>
+ #include <spa/utils/json.h>
+ 
+ #include "ntstatus.h"
+@@ -86,8 +88,11 @@
+ #include "../mmdevapi/unixlib.h"
+ 
  #include "mult.h"
++#include "presentation.h"
++#include "recovery.h"
  
  WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
 +WINE_DECLARE_DEBUG_CHANNEL(pipewire_clock);
  
  #define PW_CHANNELS_MAX 64
  
-@@ -179,6 +180,7 @@
+@@ -179,6 +184,11 @@
      UINT32 rate_connected; /* negotiated stream rate; SPA_PROP_rate is absolute vs this */
      char last_error[128]; /* set on ERROR callback; emitted once from Wine path */
      BOOL pending_error;
 +    BOOL error_reported;
++    char *app_name;
++    struct wine_pipewire_recovery recovery;
++    UINT64 graph_quantum; /* process callback only; cleared after destroying the node */
++    const struct spa_io_position *position;
  
      DWORD flags;
      AUDCLNT_SHAREMODE share;
-@@ -229,10 +231,13 @@
+@@ -186,6 +196,7 @@
+     float vol[PW_CHANNELS_MAX];
+ 
+     REFERENCE_TIME def_period;
++    REFERENCE_TIME latency_bound;
+ 
+     INT32 locked;
+     BOOL started; /* atomic: control release-stores, process callback load-acquires */
+@@ -197,6 +208,8 @@
+      * reach it only through the data loop. */
+     SIZE_T lcl_offs_bytes, pa_offs_bytes;
+     SIZE_T tmp_buffer_bytes, held_bytes, pa_held_bytes;
++    SIZE_T max_pw_buffer_bytes, pa_target_bytes; /* atomic target, loop-lock capacity */
++    SIZE_T latency_bound_bytes; /* fixed lifetime bound; may exceed the current ring */
+     BYTE *local_buffer, *tmp_buffer;
+     void *locked_ptr;
+     UINT64 mmdev_period_usec;
+@@ -227,12 +240,36 @@
+     UINT32 cap_next_seq;  /* consumer-private: sequence expected next */
+ 
      INT64 clock_lastpos, clock_written;
++    UINT64 presentation_submit_frames; /* atomic: process callback, getter/control load */
++    UINT64 presentation_epoch;
++    UINT64 presentation_native_origin; /* basis input, anchored to the retained native extent */
++    UINT64 presentation_public_origin; /* frozen public position captured at Start */
++    UINT64 presentation_resume_origin; /* oldest native frame retained at Stop */
++    BOOL presentation_resume_origin_valid; /* control-thread queue snapshot is usable */
++    BOOL presentation_resume_uncertain; /* retained native extent could not be measured */
++    BOOL presentation_async_dispatch; /* effective dispatch after connect */
++    BOOL presentation_reanchor_pending; /* no post-Start span has been published */
++    struct wine_presentation_basis presentation_latest; /* complete basis, sequence published */
++    UINT32 presentation_latest_seq; /* atomic: process writer, getter reader */
++    UINT64 presentation_last_position;
++    UINT64 presentation_last_qpc;
++    UINT32 presentation_fault; /* atomic: process callback, Wine worker consumes */
++    BOOL presentation_snapshot_valid;
++    BOOL presentation_last_observation_valid; /* process callback only */
++    struct wine_presentation_observation presentation_last_observation;
++    BOOL presentation_last_span_valid; /* process callback only */
++    UINT64 presentation_last_span_end_ns;
++    UINT32 presentation_observation_misses; /* atomic: callback diagnostic */
++    UINT32 presentation_observation_last_reason; /* atomic: callback diagnostic */
      /* atomic: process callback relaxed-increments, timer/control relaxed-load */
      UINT32 underrun_count, overrun_count, bad_buffer_count;
-+    UINT32 max_request_frames, max_suggested_frames; /* atomic, callback-owned maxima */
++    UINT32 max_request_frames, max_refill_frames, max_suggested_frames; /* atomic, callback-owned maxima */
 +    UINT32 underrun_reported;
 +    UINT64 underrun_log_time_usec;
      UINT32 ring_warned;   /* RING_OP_* bits already reported for this stream */
@@ -769,7 +1315,17 @@ index cae9879f234c..1b37f7a4a302 100644
  
      /* journal_w: producer counter, atomic, bumped from the PW callback.
       * journal_r: consumer cursor, Wine threads only, under the loop lock. */
-@@ -292,6 +297,7 @@
+@@ -248,6 +285,9 @@
+     struct list period_entry;
+     struct pipewire_period *period;
+ };
++
++static HRESULT ensure_render_ring_capacity(struct pipewire_stream *stream);
++static int stream_loop_locked(struct pipewire_stream *stream, spa_invoke_func_t fn);
+ 
+ typedef struct _ACPacket
+ {
+@@ -292,6 +332,7 @@
      struct list entry;
      char *device;
      UINT64 period_usec;
@@ -777,7 +1333,7 @@ index cae9879f234c..1b37f7a4a302 100644
      struct list streams;
      HANDLE timer_thread;
      LONG please_quit; /* atomic: release_stream store-release, timer load-acquire */
-@@ -305,6 +311,7 @@
+@@ -305,6 +346,7 @@
   * ---------------------------------------------------------------------- */
  
  static struct pw_thread_loop *pw_loop_global;
@@ -785,7 +1341,143 @@ index cae9879f234c..1b37f7a4a302 100644
  static struct pw_context *pw_ctx;
  static struct pw_core *pw_core_global;
  static struct spa_hook core_listener;
-@@ -1038,6 +1045,13 @@
+@@ -323,6 +365,9 @@
+ static struct list active_periods = LIST_INIT(active_periods);
+ static char g_default_sink[256];
+ static char g_default_source[256];
++static UINT32 g_min_quantum;
++static UINT32 g_max_quantum;
++static UINT32 g_clock_rate;
+ 
+ /* ----------------------------------------------------------------------
+  * Small helpers
+@@ -466,21 +511,12 @@
+ #define CB_MARK(s, ph) \
+     __atomic_store_n(&(s)->cb_mark, ((s)->cb_seq << 2) | (ph), __ATOMIC_RELAXED)
+ 
+-/* Render dispatch mode, read from the environment once per process.  With
+- * PW_STREAM_FLAG_RT_PROCESS the callback runs on PipeWire's realtime data
+- * thread rather than the thread loop, which removes the lock that serialized
+- * it against the control paths; what that is worth in latency is the graph's
+- * decision.  Capture never sets it: its source is its own driver, so it has
+- * nothing to win for the same exposure. */
++/* Exclusive event render requires synchronous data-loop dispatch.  The legacy
++ * switch also requests it for other render streams; it does not promote a
++ * thread to SCHED_FIFO/RR. */
+ static BOOL rt_render;
+-
+-/* Realtime CPU budget below which arming RT_PROCESS is a process kill rather
+- * than a latency choice.  RLIMIT_RTTIME counts only CPU burned without a
+- * blocking syscall and an audio callback blocks every quantum, so the floor
+- * sits well above any sane callback and well below the 200 ms a working rtkit
+- * grants.  module-rt itself defaults rt.time.soft/hard to unlimited, so a
+- * small value here is always something the environment imposed. */
+-#define RT_TIME_FLOOR_USEC 20000
++static const char render_data_loops[] =
++    "[ { thread.name = winepipewire-data loop.class = data loop.rt-prio = 0 } ]";
+ 
+ /* The process-wide budget every SCHED_FIFO/RR thread here is judged against.
+  * Either pointer may be NULL.  A failed read reports unlimited: not knowing
+@@ -824,6 +860,8 @@
+     unsigned char ident[5];
+     int fd, n;
+ 
++    if (!dir || !dir[0])
++        return FALSE;
+     snprintf(path, sizeof(path), "%s/support/libspa-support.so", dir);
+     /* O_CLOEXEC: process_attach can run with application threads already
+      * fork+exec'ing.  O_NONBLOCK: the path comes from the environment, and
+@@ -844,11 +882,11 @@
+  * live in the same libdir as the loaded library and match its architecture, so
+  * derive the path from the loaded object.  A different-architecture parent (a
+  * 32-bit launcher spawning a 64-bit game) also leaks its own SPA_PLUGIN_DIR
+- * through the environment; drop such an inherited value and re-derive ours. */
+-static void pipewire_set_plugin_dirs(void)
++ * through the environment; replace such an inherited pair with ours. */
++static BOOL pipewire_set_plugin_dirs(void)
+ {
+     Dl_info info;
+-    char libdir[PATH_MAX], path[PATH_MAX + 64], *sep;
++    char libdir[PATH_MAX], spa_path[PATH_MAX + 64], module_path[PATH_MAX + 64], *sep;
+     const char *existing = getenv("SPA_PLUGIN_DIR");
+ 
+     if (existing)
+@@ -856,44 +894,41 @@
+         if (spa_plugin_dir_usable(existing))
+         {
+             TRACE("keeping SPA_PLUGIN_DIR %s\n", existing);
+-            return;
++            return TRUE;
+         }
+         WARN("inherited SPA_PLUGIN_DIR %s is not loadable by this process; re-deriving\n", existing);
+-        unsetenv("SPA_PLUGIN_DIR");
+-        unsetenv("PIPEWIRE_MODULE_DIR");
+     }
+ 
+     if (!dladdr((void *)pw_init, &info) || !info.dli_fname)
+     {
+-        WARN("cannot locate the loaded libpipewire; leaving SPA_PLUGIN_DIR unset\n");
+-        return;
++        WARN("cannot locate the loaded libpipewire\n");
++        return FALSE;
+     }
+     if (!realpath(info.dli_fname, libdir))
+     {
+-        WARN("cannot resolve libpipewire path %s; leaving SPA_PLUGIN_DIR unset\n", info.dli_fname);
+-        return;
++        WARN("cannot resolve libpipewire path %s\n", info.dli_fname);
++        return FALSE;
+     }
+     if (!(sep = strrchr(libdir, '/')))
+-        return;
++        return FALSE;
+     *sep = 0;
+ 
+-    snprintf(path, sizeof(path), "%s/spa-0.2/support/libspa-support.so", libdir);
+-    if (access(path, F_OK))
+-    {
+-        WARN("no SPA support plugin at %s; leaving SPA_PLUGIN_DIR unset\n", path);
+-        return;
+-    }
+-
+-    snprintf(path, sizeof(path), "%s/spa-0.2", libdir);
+-    setenv("SPA_PLUGIN_DIR", path, 1);
+-    snprintf(path, sizeof(path), "%s/pipewire-0.3", libdir);
+-    /* Overwrite: reaching here means no usable SPA_PLUGIN_DIR was inherited,
+-     * so an inherited module dir is unverified and may be foreign-arch.  Both
+-     * must come from the same libdir.  An explicitly configured pair keeps
+-     * its values through the early return above. */
+-    if (!access(path, F_OK))
+-        setenv("PIPEWIRE_MODULE_DIR", path, 1);
++    snprintf(spa_path, sizeof(spa_path), "%s/spa-0.2", libdir);
++    snprintf(module_path, sizeof(module_path), "%s/pipewire-0.3", libdir);
++    if (!spa_plugin_dir_usable(spa_path) || access(module_path, R_OK | X_OK))
++    {
++        WARN("no matching PipeWire plugins under %s\n", libdir);
++        return FALSE;
++    }
++
++    /* SPA is the readiness marker also used by protonasio. */
++    if (setenv("PIPEWIRE_MODULE_DIR", module_path, 1) || setenv("SPA_PLUGIN_DIR", spa_path, 1))
++    {
++        WARN("cannot publish matching PipeWire plugin directories\n");
++        return FALSE;
++    }
+     TRACE("derived SPA plugin dir from %s\n", libdir);
++    return TRUE;
+ }
+ 
+ static NTSTATUS pipewire_process_attach(void *args)
+@@ -902,7 +937,7 @@
+     struct timespec ts;
+     UINT64 rnd = 0;
+ 
+-    pipewire_set_plugin_dirs();
++    if (!pipewire_set_plugin_dirs()) return STATUS_DLL_NOT_FOUND;
+     pw_init(NULL, NULL);
+     TRACE("PipeWire %s, header %s\n", pw_get_library_version(), pw_get_headers_version());
+ 
+@@ -1038,8 +1073,20 @@
      return S_OK;
  }
  
@@ -798,11 +1490,43 @@ index cae9879f234c..1b37f7a4a302 100644
 +
  static NTSTATUS pipewire_main_loop_start(void *args)
  {
++    struct pw_properties *props;
++    struct sched_param scheduling;
++    const char *loops;
++    int policy;
++
      pthread_mutex_lock(&pw_init_mutex);
-@@ -1057,14 +1071,27 @@
+     if (pw_loop_global)
+         goto out;
+@@ -1050,21 +1097,51 @@
+             "(set SPA_PLUGIN_DIR to the directory containing spa-0.2).\n");
+         goto out;
+     }
+-    if (!(pw_ctx = pw_context_new(pw_thread_loop_get_loop(pw_loop_global), NULL, 0)))
++    /* New PipeWire threads inherit the creator's policy.  Refuse inherited
++     * realtime scheduling before a zero RTTIME budget can kill the process. */
++    if (pthread_getschedparam(pthread_self(), &policy, &scheduling) ||
++        policy == SCHED_FIFO || policy == SCHED_RR)
++    {
++        ERR("cannot create an ordinary audio data thread from this scheduling policy\n");
++        pw_thread_loop_destroy(pw_loop_global);
++        pw_loop_global = NULL;
++        goto out;
++    }
++    props = pw_properties_new("context.data-loops", render_data_loops, NULL);
++    if (!props || !(pw_ctx = pw_context_new(pw_thread_loop_get_loop(pw_loop_global), props, 0)))
+     {
+         ERR("pw_context_new failed\n");
+         pw_thread_loop_destroy(pw_loop_global);
          pw_loop_global = NULL;
          goto out;
      }
++    loops = pw_properties_get(pw_context_get_properties(pw_ctx), "context.data-loops");
++    if (!loops || strcmp(loops, render_data_loops))
++    {
++        ERR("client configuration overrides the required ordinary audio data loop\n");
++        goto failed;
++    }
 +    if (!(render_event = pw_loop_add_event(pw_thread_loop_get_loop(pw_loop_global),
 +                                          on_render_event, NULL)))
 +    {
@@ -832,7 +1556,7 @@ index cae9879f234c..1b37f7a4a302 100644
  
  out:
      pthread_mutex_unlock(&pw_init_mutex);
-@@ -1094,6 +1121,8 @@
+@@ -1094,6 +1171,8 @@
              pw_context_destroy(pw_ctx);
              pw_ctx = NULL;
          }
@@ -841,7 +1565,85 @@ index cae9879f234c..1b37f7a4a302 100644
          pw_thread_loop_destroy(pw_loop_global);
          pw_loop_global = NULL;
      }
-@@ -1897,17 +1926,19 @@
+@@ -1163,6 +1242,8 @@
+     char default_source[256];
+     uint32_t clock_rate;
+     uint32_t min_quantum;
++    uint32_t max_quantum;
++    BOOL force_quantum;
+     BOOL core_error;
+ };
+ 
+@@ -1257,12 +1338,21 @@
+     else if (!strcmp(key, "clock.force-quantum"))
+     {
+         if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
++        {
+             p->min_quantum = v;
++            p->max_quantum = v;
++            p->force_quantum = TRUE;
++        }
+     }
+     else if (!strcmp(key, "clock.min-quantum") && !p->min_quantum)
+     {
+         if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
+             p->min_quantum = v;
++    }
++    else if (!strcmp(key, "clock.max-quantum") && !p->force_quantum)
++    {
++        if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
++            p->max_quantum = v;
+     }
+     return 0;
+ }
+@@ -1459,8 +1549,22 @@
+     }
+ }
+ 
++static void on_probe_core_info(void *data, const struct pw_core_info *info)
++{
++    struct probe *p = data;
++    const char *value;
++    uint32_t v;
++
++    if (p->max_quantum || !info || !info->props)
++        return;
++    value = spa_dict_lookup(info->props, "default.clock.max-quantum");
++    if (parse_u32(value, 10, 1, PW_MAX_QUANTUM, &v))
++        p->max_quantum = v;
++}
++
+ static const struct pw_core_events probe_core_events = {
+     PW_VERSION_CORE_EVENTS,
++    .info = on_probe_core_info,
+     .done = on_probe_core_done,
+     .error = on_probe_core_error,
+ };
+@@ -1699,6 +1803,9 @@
+     list_init(&g_render_devices);
+     list_init(&g_capture_devices);
+     g_default_sink[0] = g_default_source[0] = '\0';
++    g_min_quantum = 0;
++    g_max_quantum = 0;
++    g_clock_rate = 0;
+ 
+     params->priority = Priority_Unavailable;
+ 
+@@ -1760,8 +1867,13 @@
+     if (failed)
+         WARN("PipeWire core reported an error during the probe\n");
+     else
++    {
++        g_min_quantum = p.min_quantum;
++        g_max_quantum = p.max_quantum;
++        g_clock_rate = p.clock_rate ? p.clock_rate : 48000;
+         /* The pw loop is fully stopped: safe to do Wine string conversion. */
+         build_device_cache(&p);
++    }
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(pn, next, &p.nodes, struct probe_node, entry)
+     {
+@@ -1897,17 +2009,19 @@
      return STATUS_SUCCESS;
  }
  
@@ -867,30 +1669,641 @@ index cae9879f234c..1b37f7a4a302 100644
  
      return STATUS_SUCCESS;
  }
-@@ -2386,6 +2417,7 @@
+@@ -2291,6 +2405,452 @@
+     }
+ }
+ 
++/* Round a byte count up without allowing SIZE_T to wrap. */
++static BOOL size_round_up(SIZE_T value, SIZE_T multiple, SIZE_T *out)
++{
++    SIZE_T rem;
++
++    if (!multiple)
++        return FALSE;
++    rem = value % multiple;
++    if (rem && value > SIZE_MAX - (multiple - rem))
++        return FALSE;
++    *out = value + (rem ? multiple - rem : 0);
++    return TRUE;
++}
++
++static SIZE_T exclusive_render_min_target(const struct pipewire_stream *stream)
++{
++    return stream->period_bytes > SIZE_MAX / 2 ? SIZE_MAX : stream->period_bytes * 2;
++}
++
++/* The application-facing ring may be larger than the logical WASAPI buffer.
++ * Keep its transport target separate so a large PipeWire buffer capacity does
++ * not become latency until the process callback demonstrates the demand. */
++static SIZE_T exclusive_render_low_water(const struct pipewire_stream *stream)
++{
++    SIZE_T min_target = exclusive_render_min_target(stream);
++    SIZE_T target = __atomic_load_n(&stream->pa_target_bytes, __ATOMIC_ACQUIRE);
++
++    if (target < min_target)
++        target = min_target;
++    if (target > stream->real_bufsize_bytes)
++        target = stream->real_bufsize_bytes;
++    return target > stream->period_bytes ? target - stream->period_bytes : 0;
++}
++
++static void update_render_target(struct pipewire_stream *stream, UINT32 frames)
++{
++    SIZE_T rounded, target, min_target = exclusive_render_min_target(stream);
++    UINT64 demand64 = (UINT64)frames * stream->frame_size;
++
++    if (demand64 > SIZE_MAX || !size_round_up((SIZE_T)demand64, stream->period_bytes, &rounded)
++        || rounded > SIZE_MAX - stream->period_bytes)
++        target = stream->real_bufsize_bytes;
++    else
++        target = rounded + stream->period_bytes;
++    if (target < min_target)
++        target = min_target;
++    if (target > stream->real_bufsize_bytes)
++        target = stream->real_bufsize_bytes;
++    __atomic_store_n(&stream->pa_target_bytes, target, __ATOMIC_RELEASE);
++}
++
++static BOOL exclusive_render_capacity_size(const struct pipewire_stream *stream, SIZE_T *size)
++{
++    SIZE_T rounded, reserve;
++
++    if (stream->period_bytes > SIZE_MAX / 2)
++        return FALSE;
++    reserve = stream->period_bytes * 2;
++    if (stream->max_pw_buffer_bytes)
++    {
++        if (!size_round_up(stream->max_pw_buffer_bytes, stream->period_bytes, &rounded) ||
++            rounded > SIZE_MAX - stream->period_bytes)
++            return FALSE;
++        rounded += stream->period_bytes;
++        if (rounded > reserve)
++            reserve = rounded;
++    }
++    *size = reserve;
++    return TRUE;
++}
++
++static BOOL exclusive_render_demand_size_for_frames(const struct pipewire_stream *stream,
++                                                    UINT32 frames, BOOL refill, SIZE_T *size)
++{
++    UINT64 demand64;
++    SIZE_T rounded;
++
++    if (!frames)
++    {
++        *size = 0;
++        return TRUE;
++    }
++    demand64 = (UINT64)frames * stream->frame_size;
++    if (demand64 > SIZE_MAX || !size_round_up((SIZE_T)demand64, stream->period_bytes, &rounded) ||
++        (refill && rounded > SIZE_MAX - stream->period_bytes))
++        return FALSE;
++    *size = rounded + (refill ? stream->period_bytes : 0);
++    return TRUE;
++}
++
++static BOOL exclusive_render_demand_size(const struct pipewire_stream *stream, SIZE_T *size)
++{
++    UINT32 frames = __atomic_load_n(&stream->max_request_frames, __ATOMIC_ACQUIRE);
++    UINT32 refill = __atomic_load_n(&stream->max_refill_frames, __ATOMIC_ACQUIRE);
++    SIZE_T initial_size, refill_size;
++
++    if (!exclusive_render_demand_size_for_frames(stream, frames, FALSE, &initial_size) ||
++        !exclusive_render_demand_size_for_frames(stream, refill, TRUE, &refill_size))
++        return FALSE;
++    *size = max(initial_size, refill_size);
++    return TRUE;
++}
++
++static BOOL exclusive_render_bound_size(const struct pipewire_stream *stream, SIZE_T *size)
++{
++    UINT64 quantum_frames;
++    SIZE_T quantum_bytes, rounded;
++
++    if (!exclusive_render_capacity_size(stream, size))
++        return FALSE;
++    /* clock.max-quantum is the graph's advertised upper bound.  The minimum
++     * quantum only describes the current floor and cannot make a lifetime
++     * latency bound safe when the graph is later raised. */
++    if (g_max_quantum)
++    {
++        quantum_frames = g_max_quantum;
++        if (g_clock_rate && stream->info.rate && stream->info.rate != g_clock_rate)
++        {
++            if (quantum_frames > UINT64_MAX / stream->info.rate ||
++                quantum_frames * stream->info.rate > UINT64_MAX - (g_clock_rate - 1))
++                return FALSE;
++            quantum_frames = (quantum_frames * stream->info.rate + g_clock_rate - 1) / g_clock_rate;
++        }
++        if (quantum_frames > SIZE_MAX / stream->frame_size)
++            return FALSE;
++        quantum_bytes = (SIZE_T)quantum_frames * stream->frame_size;
++        if (!size_round_up(quantum_bytes, stream->period_bytes, &rounded) ||
++            rounded > SIZE_MAX - stream->period_bytes)
++            return FALSE;
++        rounded += stream->period_bytes;
++        if (rounded > *size)
++            *size = rounded;
++    }
++    return TRUE;
++}
++
++static BOOL set_exclusive_latency_bound(struct pipewire_stream *stream)
++{
++    SIZE_T bound_bytes, bound_frames;
++    UINT64 bound_hns;
++
++    if (!stream->frame_size || !stream->info.rate ||
++        !exclusive_render_bound_size(stream, &bound_bytes) ||
++        bound_bytes / stream->frame_size < stream->bufsize_frames)
++        return FALSE;
++    bound_frames = bound_bytes / stream->frame_size;
++    if ((UINT64)bound_frames >
++        (UINT64_MAX - (stream->info.rate - 1)) / 10000000)
++        return FALSE;
++    bound_hns = ((UINT64)bound_frames * 10000000 + stream->info.rate - 1) /
++                stream->info.rate;
++    if (bound_hns > INT64_MAX)
++        return FALSE;
++    stream->latency_bound_bytes = bound_bytes;
++    stream->latency_bound = (REFERENCE_TIME)bound_hns;
++    return TRUE;
++}
++
++static BOOL presentation_enabled(const struct pipewire_stream *stream)
++{
++    return stream->dataflow == eRender && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++           (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
++}
++
++static BOOL presentation_clock_now(UINT64 *mono_ns, UINT64 *qpc_100ns)
++{
++    struct timespec mono_before, mono_after;
++    LARGE_INTEGER qpc;
++    UINT64 mono_mid, after_ns;
++    UINT64 qpc_value;
++
++    if (!mono_ns || !qpc_100ns || clock_gettime(CLOCK_MONOTONIC, &mono_before) ||
++        NtQueryPerformanceCounter(&qpc, NULL) ||
++        clock_gettime(CLOCK_MONOTONIC, &mono_after))
++        return FALSE;
++    mono_mid = (UINT64)mono_before.tv_sec * 1000000000 + mono_before.tv_nsec;
++    after_ns = (UINT64)mono_after.tv_sec * 1000000000 + mono_after.tv_nsec;
++    if (after_ns < mono_mid)
++        return FALSE;
++    mono_mid += (after_ns - mono_mid) / 2;
++    if (qpc.QuadPart < 0)
++        return FALSE;
++    qpc_value = (UINT64)qpc.QuadPart;
++    *mono_ns = mono_mid;
++    *qpc_100ns = qpc_value;
++    return TRUE;
++}
++
++static BOOL presentation_observation(struct pipewire_stream *stream,
++                                     const struct pw_time *pwt,
++                                     struct wine_presentation_observation *observation)
++{
++    if (!pwt || !observation || !pwt->now || !pwt->rate.num || !pwt->rate.denom ||
++        !stream->info.rate)
++        return FALSE;
++    observation->now_ns = pwt->now;
++    observation->queued_frames = pwt->queued;
++    observation->buffered_frames = pwt->buffered;
++    observation->delay_ticks = pwt->delay;
++    observation->rate_num = pwt->rate.num;
++    observation->rate_denom = pwt->rate.denom;
++    observation->stream_rate = stream->info.rate;
++    return TRUE;
++}
++
++/* One writer (the process callback), bounded reader (the getter).  The basis
++ * contains every value needed for one projection; the getter never combines
++ * a live PipeWire read with a different counter or timestamp. */
++static void presentation_publish_basis(struct pipewire_stream *stream,
++                                       const struct wine_presentation_basis *basis)
++{
++    __atomic_fetch_add(&stream->presentation_latest_seq, 1, __ATOMIC_ACQ_REL);
++    __atomic_store_n(&stream->presentation_latest.epoch, basis->epoch, __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.submit_start, basis->submit_start,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.submit_end, basis->submit_end,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.native_origin, basis->native_origin,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.public_origin, basis->public_origin,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.first_ns, basis->first_ns,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.end_ns, basis->end_ns,
++                     __ATOMIC_RELAXED);
++    __atomic_store_n(&stream->presentation_latest.stream_rate, basis->stream_rate,
++                     __ATOMIC_RELAXED);
++    __atomic_fetch_add(&stream->presentation_latest_seq, 1, __ATOMIC_RELEASE);
++}
++
++static void presentation_clear_latest(struct pipewire_stream *stream)
++{
++    struct wine_presentation_basis basis = {0};
++
++    basis.epoch = stream->presentation_epoch;
++    presentation_publish_basis(stream, &basis);
++}
++
++static BOOL presentation_read_latest(struct pipewire_stream *stream,
++                                     struct wine_presentation_basis *snapshot)
++{
++    UINT32 before, after;
++
++    before = __atomic_load_n(&stream->presentation_latest_seq, __ATOMIC_ACQUIRE);
++    if (before & 1)
++        return FALSE;
++    snapshot->epoch = __atomic_load_n(&stream->presentation_latest.epoch, __ATOMIC_RELAXED);
++    snapshot->submit_start = __atomic_load_n(&stream->presentation_latest.submit_start,
++                                             __ATOMIC_RELAXED);
++    snapshot->submit_end = __atomic_load_n(&stream->presentation_latest.submit_end,
++                                           __ATOMIC_RELAXED);
++    snapshot->native_origin = __atomic_load_n(&stream->presentation_latest.native_origin,
++                                              __ATOMIC_RELAXED);
++    snapshot->public_origin = __atomic_load_n(&stream->presentation_latest.public_origin,
++                                              __ATOMIC_RELAXED);
++    snapshot->first_ns = __atomic_load_n(&stream->presentation_latest.first_ns,
++                                         __ATOMIC_RELAXED);
++    snapshot->end_ns = __atomic_load_n(&stream->presentation_latest.end_ns,
++                                       __ATOMIC_RELAXED);
++    snapshot->stream_rate = __atomic_load_n(&stream->presentation_latest.stream_rate,
++                                            __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    after = __atomic_load_n(&stream->presentation_latest_seq, __ATOMIC_ACQUIRE);
++    return before == after;
++}
++
++/* Deactivation leaves PipeWire's output and converter queues intact.  On the
++ * supported PipeWire implementation, get_time_n still fills a complete
++ * seqlock snapshot before returning -EIO for PAUSED.  Accept that snapshot
++ * only after checking the paused state and the fields used for the native
++ * extent; the first resumed process callback is too late because Start may
++ * already have popped retained buffers. */
++static BOOL presentation_read_resume_origin(struct pipewire_stream *stream,
++                                            UINT64 *submit_frames, UINT64 *queued_frames,
++                                            UINT64 *buffered_frames, UINT64 *native_origin,
++                                            BOOL allow_paused, int *time_result,
++                                            enum pw_stream_state *state_result)
++{
++    struct pw_time time = {0};
++    enum pw_stream_state state;
++    const char *error = NULL;
++    int result;
++    UINT64 submit, origin;
++
++    if (time_result) *time_result = -ENODEV;
++    if (state_result) *state_result = PW_STREAM_STATE_ERROR;
++    if (!stream->pw)
++        return FALSE;
++    result = pw_stream_get_time_n(stream->pw, &time, sizeof(time));
++    state = pw_stream_get_state(stream->pw, &error);
++    if (time_result) *time_result = result;
++    if (state_result) *state_result = state;
++    if (state != PW_STREAM_STATE_STREAMING &&
++        !(allow_paused && state == PW_STREAM_STATE_PAUSED))
++        return FALSE;
++    if (result < 0 && !(allow_paused && state == PW_STREAM_STATE_PAUSED &&
++                        result == -EIO))
++        return FALSE;
++    if (time.now <= 0 || !time.rate.num || !time.rate.denom)
++        return FALSE;
++    submit = __atomic_load_n(&stream->presentation_submit_frames, __ATOMIC_ACQUIRE);
++    if (!wine_presentation_resume_origin(submit, time.queued, time.buffered, &origin))
++        return FALSE;
++    if (submit_frames) *submit_frames = submit;
++    if (queued_frames) *queued_frames = time.queued;
++    if (buffered_frames) *buffered_frames = time.buffered;
++    if (native_origin) *native_origin = origin;
++    return TRUE;
++}
++
++static BOOL presentation_reanchor(struct pipewire_stream *stream)
++{
++    UINT64 submit, native_origin, public_origin;
++
++    if (!presentation_enabled(stream))
++        return TRUE;
++    if (__atomic_load_n(&stream->presentation_resume_uncertain, __ATOMIC_ACQUIRE))
++        return FALSE;
++    submit = __atomic_load_n(&stream->presentation_submit_frames, __ATOMIC_ACQUIRE);
++    native_origin = submit;
++    if (stream->presentation_resume_origin_valid &&
++        stream->presentation_resume_origin <= submit)
++        native_origin = stream->presentation_resume_origin;
++    if (!wine_presentation_reanchor(stream->presentation_native_origin,
++                                    stream->presentation_public_origin,
++                                    native_origin, &public_origin))
++        return FALSE;
++    /* Stop's projected position and the first retained source frame differ.
++     * Preserve the source/public mapping across the pause, including frames
++     * already transferred downstream before the deactivation barrier. */
++    stream->presentation_epoch++;
++    stream->presentation_native_origin = native_origin;
++    stream->presentation_public_origin = public_origin;
++    __atomic_store_n(&stream->presentation_reanchor_pending, TRUE, __ATOMIC_RELEASE);
++    presentation_clear_latest(stream);
++    stream->presentation_last_observation_valid = FALSE;
++    stream->presentation_last_span_valid = FALSE;
++    stream->presentation_last_span_end_ns = 0;
++    return TRUE;
++}
++
++static void presentation_reset(struct pipewire_stream *stream)
++{
++    if (!presentation_enabled(stream))
++        return;
++    __atomic_store_n(&stream->presentation_submit_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->presentation_fault, 0, __ATOMIC_RELEASE);
++    stream->presentation_epoch++;
++    stream->presentation_native_origin = 0;
++    stream->presentation_public_origin = 0;
++    stream->presentation_resume_origin = 0;
++    stream->presentation_resume_origin_valid = FALSE;
++    __atomic_store_n(&stream->presentation_resume_uncertain, FALSE, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->presentation_reanchor_pending, FALSE, __ATOMIC_RELEASE);
++    stream->presentation_last_position = 0;
++    stream->presentation_last_qpc = 0;
++    stream->presentation_snapshot_valid = FALSE;
++    stream->presentation_last_observation_valid = FALSE;
++    stream->presentation_last_span_valid = FALSE;
++    stream->presentation_last_span_end_ns = 0;
++    __atomic_store_n(&stream->presentation_observation_misses, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->presentation_observation_last_reason, 0, __ATOMIC_RELEASE);
++    presentation_clear_latest(stream);
++}
++
++/* The process callback records only this bit.  The Wine loop consumes it and
++ * performs the actual invalidation on its side of the barrier. */
++static BOOL presentation_consume_fault(struct pipewire_stream *stream)
++{
++    UINT32 fault;
++
++    if (!presentation_enabled(stream) ||
++        !(fault = __atomic_exchange_n(&stream->presentation_fault, 0, __ATOMIC_ACQ_REL)))
++        return FALSE;
++    WARN("presentation transport fault %#x.\n", fault);
++    copy_cstr(stream->last_error, sizeof(stream->last_error),
++              "presentation transport fault");
++    stream->pending_error = TRUE;
++    stream->error_reported = FALSE;
++    return TRUE;
++}
++
++/* Project from one complete process-published basis and one current
++ * MONOTONIC/QPC pair. */
++static BOOL presentation_project(struct pipewire_stream *stream, UINT64 *position,
++                                 UINT64 *qpc_100ns)
++{
++    struct wine_presentation_basis latest;
++    UINT64 now_ns, now_qpc, projected;
++
++    if (!position || !qpc_100ns || !presentation_clock_now(&now_ns, &now_qpc))
++        return FALSE;
++    if (!__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
++    {
++        *position = stream->presentation_last_position;
++        if (!stream->presentation_last_qpc)
++            stream->presentation_last_qpc = now_qpc;
++        stream->presentation_snapshot_valid = TRUE;
++        *qpc_100ns = stream->presentation_last_qpc;
++        return TRUE;
++    }
++    if (!presentation_read_latest(stream, &latest) ||
++        latest.epoch != stream->presentation_epoch || !latest.submit_end ||
++        !wine_presentation_project_basis(&latest, now_ns, &projected))
++        return FALSE;
++    if (stream->presentation_snapshot_valid && projected < stream->presentation_last_position)
++        return FALSE;
++    stream->presentation_last_position = projected;
++    stream->presentation_last_qpc = now_qpc;
++    stream->presentation_snapshot_valid = TRUE;
++    *position = projected;
++    *qpc_100ns = now_qpc;
++    return TRUE;
++}
++
++/* Stop takes this pair before deactivation.  It is deliberately separate
++ * from presentation_project so a missing PipeWire timing sample leaves the
++ * last coherent pair latched instead of inventing a new timestamp. */
++static BOOL presentation_freeze(struct pipewire_stream *stream)
++{
++    UINT64 position, qpc, now_ns, now_qpc;
++
++    if (!presentation_enabled(stream))
++        return FALSE;
++    if (presentation_project(stream, &position, &qpc))
++    {
++        stream->presentation_last_position = position;
++        stream->presentation_last_qpc = qpc;
++        stream->presentation_snapshot_valid = TRUE;
++        return TRUE;
++    }
++    /* Before the first native span, the public origin paired with current QPC
++     * is coherent.  Do not use this fallback after accepted native
++     * frames exist: a missing basis there is an uncertainty, not a reset. */
++    if (__atomic_load_n(&stream->presentation_submit_frames, __ATOMIC_ACQUIRE) == 0 &&
++        __atomic_load_n(&stream->presentation_reanchor_pending, __ATOMIC_ACQUIRE) &&
++        presentation_clock_now(&now_ns, &now_qpc))
++    {
++        stream->presentation_last_position = stream->presentation_public_origin;
++        stream->presentation_last_qpc = now_qpc;
++        stream->presentation_snapshot_valid = TRUE;
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ /* Foreign PipeWire thread: no Wine calls.  The release store to seq publishes
+  * the slot, so the consumer never sees a half-filled entry. */
+ static void stream_journal_record(struct pipewire_stream *stream, enum pw_stream_state old,
+@@ -2352,12 +2912,52 @@
+         pw_thread_loop_signal(pw_loop_global, false);
+ }
+ 
++/* Runs during buffer negotiation.  Keep only the numeric capacity; no
++ * pw_buffer or spa_data pointer is retained after this callback. */
++static void on_stream_add_buffer(void *data, struct pw_buffer *buffer)
++{
++    struct pipewire_stream *stream = data;
++    SIZE_T maxsize = 0;
++    UINT32 i;
++
++    if (stream->share != AUDCLNT_SHAREMODE_EXCLUSIVE ||
++        !(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        return;
++    if (!buffer || !buffer->buffer || !buffer->buffer->datas)
++        return;
++    for (i = 0; i < buffer->buffer->n_datas; i++)
++        if (buffer->buffer->datas[i].maxsize > maxsize)
++            maxsize = buffer->buffer->datas[i].maxsize;
++    if (maxsize > stream->max_pw_buffer_bytes)
++    {
++        stream->max_pw_buffer_bytes = maxsize;
++        if (pw_loop_global)
++            pw_thread_loop_signal(pw_loop_global, false);
++    }
++}
++
++static void on_stream_io_changed(void *data, uint32_t id, void *area, uint32_t size)
++{
++    struct pipewire_stream *stream = data;
++
++    if (id == SPA_IO_Position)
++        __atomic_store_n(&stream->position,
++                         size >= sizeof(struct spa_io_position) ? area : NULL, __ATOMIC_RELEASE);
++}
++
+ static void on_stream_process(void *data)
+ {
+     struct pipewire_stream *stream = data;
+     struct pw_buffer *b;
+     struct spa_buffer *buf;
+     struct spa_data *d;
++    BOOL presentation_stream = FALSE, have_presentation_basis = FALSE;
++    UINT32 presentation_req_frames = 0;
++    UINT64 presentation_first_ns = 0, presentation_end_ns = 0;
++    UINT64 presentation_submit_start = 0;
++    UINT64 presentation_check_position;
++    UINT32 presentation_observation_reason = 0;
++    struct wine_presentation_observation presentation_obs;
+ 
+     stream->cb_seq++;
+     CB_MARK(stream, CB_ENTER);
+@@ -2385,17 +2985,120 @@
+     if (stream->dataflow == eRender)
      {
          UINT32 maxsize = d->maxsize;
-         UINT32 req_frames, need_bytes, n, c;
-+        SIZE_T held;
+-        UINT32 req_frames, need_bytes, n, c;
++        UINT32 req_frames, need_bytes, n = 0, c, max_frames = maxsize / stream->frame_size;
++        SIZE_T held, demand_size;
++        struct pw_time pwt = {0};
++        const struct spa_io_position *position;
++        BOOL have_pwt, running;
          float vol[PW_CHANNELS_MAX];
  
-         if (!b->requested || b->requested > maxsize / stream->frame_size)
-@@ -2396,6 +2428,14 @@
- 
-         if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
-         {
+-        if (!b->requested || b->requested > maxsize / stream->frame_size)
+-            req_frames = maxsize / stream->frame_size;
++        running = __atomic_load_n(&stream->started, __ATOMIC_ACQUIRE);
++        have_pwt = !pw_stream_get_time_n(stream->pw, &pwt, sizeof(pwt));
++        position = __atomic_load_n(&stream->position, __ATOMIC_ACQUIRE);
++        if (presentation_enabled(stream) && running && position && position->clock.duration)
++        {
++            /* pw_time.size follows converter demand at the stream rate;
++             * only the driver's IO position describes the graph quantum. */
++            if (stream->graph_quantum && stream->graph_quantum != position->clock.duration)
++            {
++                __atomic_add_fetch(&stream->recovery.generation, 1, __ATOMIC_RELEASE);
++                __atomic_store_n(&stream->recovery.pending, 1, __ATOMIC_RELEASE);
++                pw_loop_signal_event(pw_thread_loop_get_loop(pw_loop_global), render_event);
++            }
++            stream->graph_quantum = position->clock.duration;
++        }
++        if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE)) running = FALSE;
++        presentation_stream = presentation_enabled(stream) && running;
++        if (b->requested)
++            req_frames = b->requested > max_frames ? max_frames : (UINT32)b->requested;
++        else if (have_pwt && pwt.size)
++            req_frames = pwt.size > max_frames ? max_frames : (UINT32)pwt.size;
+         else
+-            req_frames = (UINT32)b->requested;
++            req_frames = max_frames;
+         need_bytes = req_frames * stream->frame_size;
+-
+-        if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
+-        {
++        if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE) &&
++            have_pwt && pwt.now && pwt.size && pwt.rate.num && pwt.rate.denom)
++        {
++            __atomic_store_n(&stream->max_refill_frames, req_frames, __ATOMIC_RELEASE);
++            __atomic_store_n(&stream->recovery.ready, 1, __ATOMIC_RELEASE);
++            pw_loop_signal_event(pw_thread_loop_get_loop(pw_loop_global), render_event);
++        }
++        presentation_submit_start = __atomic_load_n(&stream->presentation_submit_frames,
++                                                    __ATOMIC_RELAXED);
++        presentation_req_frames = req_frames;
++
++        /* This is the prequeue observation.  In particular, do not add the
++         * current req_frames to T0: it belongs to the span length. */
++        if (presentation_stream && req_frames)
++        {
++            if (!have_pwt)
++                presentation_observation_reason = 1; /* startup snapshot unavailable */
++            else if (!presentation_observation(stream, &pwt, &presentation_obs))
++                presentation_observation_reason = 2; /* invalid PW time fields */
++            else if (!wine_presentation_first_ns(&presentation_obs, &presentation_first_ns))
++                presentation_observation_reason = 4; /* checked arithmetic overflow */
++            else if (!wine_presentation_span_end(presentation_first_ns, req_frames,
++                                                 stream->info.rate, &presentation_end_ns))
++                presentation_observation_reason = 8; /* span arithmetic overflow */
++            else
++            {
++                have_presentation_basis = TRUE;
++                /* PipeWire's converter can report one startup span overlapping the
++                 * preceding observation by more than one frame.  Record that
++                 * bounded uncertainty for diagnostics, but retain the measured
++                 * timestamp and publish the complete basis; changing the time
++                 * or invalidating a valid stream would lose accepted client data. */
++                if (stream->presentation_last_observation_valid &&
++                    stream->presentation_last_span_valid &&
++                    !wine_presentation_span_contiguous(&stream->presentation_last_observation,
++                                                       &presentation_obs,
++                                                       stream->presentation_last_span_end_ns,
++                                                       presentation_first_ns))
++                    presentation_observation_reason = 16; /* observed overlap/drift */
++            }
++        }
++        if (presentation_stream && presentation_req_frames &&
++            __atomic_load_n(&stream->presentation_resume_uncertain, __ATOMIC_ACQUIRE))
++        {
++            /* A first resumed callback can already have popped retained
++             * native buffers.  Until Stop supplied a validated paused
++             * snapshot, its remaining queued/buffered count cannot establish
++             * the retained origin.  Keep accepted PCM and the public timeline
++             * frozen, and report S_FALSE through the normal uncertainty path. */
++            have_presentation_basis = FALSE;
++            presentation_observation_reason |= 32; /* resume extent unavailable */
++        }
++        if (presentation_stream && presentation_observation_reason)
++        {
++            __atomic_add_fetch(&stream->presentation_observation_misses, 1, __ATOMIC_RELAXED);
++            __atomic_store_n(&stream->presentation_observation_last_reason,
++                             presentation_observation_reason, __ATOMIC_RELAXED);
++        }
++        else if (presentation_stream && have_presentation_basis)
++            __atomic_store_n(&stream->presentation_observation_last_reason, 0, __ATOMIC_RELAXED);
++
++        if (running)
++        {
 +            UINT32 suggested = min(b->requested, UINT32_MAX);
 +
 +            /* requested is a suggestion, not a capacity error. Record both
 +             * it and the resolved size without changing playback. */
 +            if (req_frames > __atomic_load_n(&stream->max_request_frames, __ATOMIC_RELAXED))
 +                __atomic_store_n(&stream->max_request_frames, req_frames, __ATOMIC_RELAXED);
++            /* Converter priming may consume the reserve once; later requests need a full refill period. */
++            if (presentation_submit_start &&
++                req_frames > __atomic_load_n(&stream->max_refill_frames, __ATOMIC_RELAXED))
++                __atomic_store_n(&stream->max_refill_frames, req_frames, __ATOMIC_RELAXED);
 +            if (suggested > __atomic_load_n(&stream->max_suggested_frames, __ATOMIC_RELAXED))
 +                __atomic_store_n(&stream->max_suggested_frames, suggested, __ATOMIC_RELAXED);
++            if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++                (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++            {
++                update_render_target(stream, req_frames);
++                if (!exclusive_render_demand_size(stream, &demand_size) ||
++                    (stream->latency_bound_bytes && demand_size > stream->latency_bound_bytes))
++                    pw_loop_signal_event(pw_thread_loop_get_loop(pw_loop_global), render_event);
++            }
              /* copy_from_ring wraps once, so a count above the ring size
               * would read past the allocation. */
              n = min(need_bytes, __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE));
-@@ -2411,7 +2451,11 @@
+@@ -2411,7 +3114,11 @@
                  __atomic_add_fetch(&stream->underrun_count, 1, __ATOMIC_RELAXED);
              }
              stream->pa_offs_bytes = (stream->pa_offs_bytes + n) % stream->real_bufsize_bytes;
@@ -898,13 +2311,83 @@ index cae9879f234c..1b37f7a4a302 100644
 +            held = __atomic_sub_fetch(&stream->pa_held_bytes, n, __ATOMIC_RELEASE);
 +            if (n && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
 +                (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
-+                held <= stream->period_bytes)
++                held <= exclusive_render_low_water(stream))
 +                pw_loop_signal_event(pw_thread_loop_get_loop(pw_loop_global), render_event);
          }
          else
              silence_buffer(stream->info.format, d->data, need_bytes);
-@@ -2518,16 +2562,17 @@
+@@ -2494,13 +3201,64 @@
+         }
+     }
+ 
+-    pw_stream_queue_buffer(stream->pw, b);
++    {
++        int queue_result = pw_stream_queue_buffer(stream->pw, b);
++
++        if (stream->dataflow == eRender && presentation_stream)
++        {
++            if (queue_result < 0)
++                __atomic_store_n(&stream->presentation_fault, 0x1, __ATOMIC_RELEASE);
++            else if (presentation_req_frames)
++            {
++                if (presentation_submit_start > UINT64_MAX - presentation_req_frames)
++                    __atomic_store_n(&stream->presentation_fault, 0x2, __ATOMIC_RELEASE);
++                else
++                {
++                    UINT64 native_submit_end = presentation_submit_start + presentation_req_frames;
++                    struct wine_presentation_basis basis;
++
++                    /* P_submit is the accepted native coordinate.  Advance it
++                     * for every successful queue, including a startup callback
++                     * without a coherent timing snapshot. */
++                    __atomic_store_n(&stream->presentation_submit_frames,
++                                     native_submit_end, __ATOMIC_RELEASE);
++                    if (have_presentation_basis)
++                    {
++                        basis.epoch = stream->presentation_epoch;
++                        basis.submit_start = presentation_submit_start;
++                        basis.submit_end = native_submit_end;
++                        basis.native_origin = stream->presentation_native_origin;
++                        basis.public_origin = stream->presentation_public_origin;
++                        basis.first_ns = presentation_first_ns;
++                        basis.end_ns = presentation_end_ns;
++                        basis.stream_rate = stream->info.rate;
++                        if (basis.native_origin > basis.submit_start ||
++                            !wine_presentation_project_basis(&basis, presentation_first_ns,
++                                                             &presentation_check_position))
++                            __atomic_store_n(&stream->presentation_fault, 0x8, __ATOMIC_RELEASE);
++                        else
++                        {
++                            presentation_publish_basis(stream, &basis);
++                            __atomic_store_n(&stream->presentation_reanchor_pending, FALSE,
++                                             __ATOMIC_RELEASE);
++                            stream->presentation_last_span_end_ns = presentation_end_ns;
++                            stream->presentation_last_span_valid = TRUE;
++                            stream->presentation_last_observation = presentation_obs;
++                            stream->presentation_last_observation_valid = TRUE;
++                        }
++                    }
++                }
++            }
++        }
++    }
+     CB_MARK(stream, CB_DONE);
+ }
+ 
+ static const struct pw_stream_events stream_events = {
+     PW_VERSION_STREAM_EVENTS,
+     .state_changed = on_stream_state_changed,
++    .io_changed = on_stream_io_changed,
++    .add_buffer = on_stream_add_buffer,
+     .process = on_stream_process,
+ };
+ 
+@@ -2516,18 +3274,21 @@
+     if (!stream)
+         return FALSE;
      stream_journal_flush(stream);
++    presentation_consume_fault(stream);
++    if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE)) return TRUE;
      if (stream->pending_error)
      {
 -        if (stream->pw)
@@ -931,7 +2414,7 @@ index cae9879f234c..1b37f7a4a302 100644
          return FALSE;
      st = pw_stream_get_state(stream->pw, NULL);
      return st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING;
-@@ -2544,29 +2589,37 @@
+@@ -2544,55 +3305,39 @@
  
  /* Called with the loop lock held.  Waits out CONNECTING so the caller sees a
   * stream that has either negotiated or failed, never one still in flight. */
@@ -981,17 +2464,117 @@ index cae9879f234c..1b37f7a4a302 100644
 +    }
      WARN("stream %p connect timed out in state %d: %s.\n", stream, st, debugstr_a(error));
      return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+-}
+-
+-/* At ERR because the alternative is a process the kernel kills without a
+- * diagnostic, and the reporter will not have set WINEDEBUG. */
+-static void rt_gate_report(UINT64 soft, UINT64 hard, BOOL late)
+-{
+-    char buf[32];
+-
+-    ERR("audio dispatch: realtime CPU budget is %s, under the %u us floor, so a "
+-        "realtime data thread would be killed by the kernel on its first "
+-        "quantum.  %s  This process keeps the driver loop for every stream from "
+-        "here.  session=%016llx\n",
+-        rt_time_str(buf, sizeof(buf), soft), RT_TIME_FLOOR_USEC,
+-        late ? "The budget was written while the stream was connecting, so it is "
+-               "being reconnected without RT_PROCESS."
+-             : "Connecting without RT_PROCESS.",
+-        (unsigned long long)dispatch_token);
+-
+-    if (hard < RT_TIME_FLOOR_USEC)
+-        ERR("audio dispatch: the hard limit is %s, so nothing unprivileged can "
+-            "raise it.  Install rtkit and restart xdg-desktop-portal so it "
+-            "re-reads the provider, or launch with WINEPIPEWIRE_RT=0.  "
+-            "session=%016llx\n", rt_time_str(buf, sizeof(buf), hard),
+-            (unsigned long long)dispatch_token);
  }
-@@ -2720,6 +2773,8 @@
+ 
+ /* Certify where the process callback actually ended up.  RT_PROCESS asks for
+@@ -2608,12 +3353,11 @@
+  * Once per distinct (dataflow, requested, effective, async) combination.  The
+  * matched case is WARN so the A/B recipe can grep it without full tracing;
+  * anything needing action is at ERR.  Called with the loop lock held. */
+-static void report_dispatch_mode(struct pipewire_stream *stream, BOOL rt_render)
++static void report_dispatch_mode(struct pipewire_stream *stream, BOOL want_data)
+ {
+     struct pw_loop *dl = pw_stream_get_data_loop(stream->pw);
+     const struct pw_properties *sprops = pw_stream_get_properties(stream->pw);
+     const char *async = sprops ? pw_properties_get(sprops, PW_KEY_NODE_ASYNC) : NULL;
+-    const BOOL want_data = rt_render && stream->dataflow == eRender;
+     const BOOL got_data = dl != pw_thread_loop_get_loop(pw_loop_global);
+     const BOOL async_on = async && pw_properties_parse_bool(async);
+     const UINT32 bit = 1u << ((stream->dataflow == eRender ? 8 : 0) |
+@@ -2624,6 +3368,7 @@
+     UINT64 rt_soft;
+     char rt_buf[32];
+ 
++    stream->presentation_async_dispatch = stream->dataflow == eRender && (!got_data || async_on);
+     if (reported & bit)
+         return;
+     reported |= bit;
+@@ -2679,17 +3424,19 @@
+ }
+ 
+ /* Called with the loop lock held. */
+-static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const char *device,
+-                                       const WCHAR *appname)
++static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, BOOL wait)
+ {
+     struct pw_properties *props;
+     uint8_t buffer[1024];
+     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+     const struct spa_pod *params[1];
+     SIZE_T period_frames;
+-    char *app;
++    const char *app = stream->app_name;
++    const char *device = stream->device;
+     static LONG stream_number;
+     char media_name[32];
++    BOOL data_dispatch = stream->dataflow == eRender &&
++                         (rt_render || presentation_enabled(stream));
+ 
+     props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
+                               PW_KEY_MEDIA_CATEGORY,
+@@ -2698,7 +3445,6 @@
+     if (!props)
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+ 
+-    app = app_name_from_wstr(appname);
+     if (app)
+     {
+         pw_properties_set(props, PW_KEY_APP_NAME, app);
+@@ -2714,12 +3460,20 @@
+     period_frames = stream->period_bytes / stream->frame_size;
+     if (period_frames > UINT32_MAX)
+     {
+-        free(app);
+         pw_properties_free(props);
+         return E_INVALIDARG;
      }
      pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%u",
                         (UINT32)period_frames, stream->info.rate);
 +    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++    {
 +        pw_properties_set(props, PW_KEY_NODE_EXCLUSIVE, "true");
++        pw_properties_set(props, PW_KEY_NODE_LOCK_QUANTUM, "true");
++        pw_properties_set(props, "node.dont-fallback", "true");
++        pw_properties_set(props, "node.dont-move", "true");
++    }
++    if (data_dispatch)
++        pw_properties_set(props, PW_KEY_NODE_LOOP_NAME, "winepipewire-data");
      if (device && device[0])
          pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
      if (stream->dataflow == eCapture &&
-@@ -2749,9 +2804,12 @@
+@@ -2732,7 +3486,6 @@
+     snprintf(media_name, sizeof(media_name), "audio stream #%d",
+              (int)InterlockedIncrement(&stream_number));
+     stream->pw = pw_stream_new(pw_core_global, media_name, props);
+-    free(app);
+     if (!stream->pw)
+     {
+         WARN("pw_stream_new failed.\n");
+@@ -2749,45 +3502,19 @@
      }
  
      {
@@ -1004,26 +2587,129 @@ index cae9879f234c..1b37f7a4a302 100644
 +                                     PW_STREAM_FLAG_DONT_RECONNECT;
          enum pw_direction dir = stream->dataflow == eRender ?
                                  PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT;
-         UINT64 rt_soft, rt_hard;
-@@ -2796,7 +2854,7 @@
+-        UINT64 rt_soft, rt_hard;
+         HRESULT hr;
+         int rc;
+ 
+-        /* Arming RT_PROCESS asks module-rt to promote the data loop thread to
+-         * a realtime policy, after which the kernel judges it against the
+-         * process-wide RLIMIT_RTTIME.  A zero budget kills that thread on its
+-         * first quantum: the kernel tests the hard limit first and sends
+-         * SIGKILL outright, never reaching the catchable SIGXCPU
+-         * (posix-cpu-timers.c, check_thread_timers), and module-rt writes the
+-         * advertised value to soft and hard alike.  No core, no handler,
+-         * nothing in a crash report.
+-         *
+-         * Zero arrives by inheritance.  module-rt on the RTKit path clamps
+-         * rt.time.soft and rt.time.hard to what the desktop portal
+-         * advertises, and a portal exporting Realtime with no rtkit behind it
+-         * advertises zero.  The clamp is process-wide, lowers the hard limit
+-         * and survives exec, so a launcher that opened audio first hands
+-         * every process it spawns a budget of zero.
+-         *
+-         * Read before arming, not after: the loop runs during negotiation, so
+-         * a stream checked once it has settled can be killed before it can be
+-         * reconnected, while a thread that was never promoted cannot. */
+-        rt_time_limit(&rt_soft, &rt_hard);
+-        if (rt_render && stream->dataflow == eRender)
+-        {
+-            if (rt_soft < RT_TIME_FLOOR_USEC)
+-            {
+-                rt_gate_report(rt_soft, rt_hard, FALSE);
+-                rt_render = FALSE;
+-            }
+-            else
+-                flags |= PW_STREAM_FLAG_RT_PROCESS;
+-        }
++        if (data_dispatch)
++            flags |= PW_STREAM_FLAG_RT_PROCESS;
+ 
+         rc = pw_stream_connect(stream->pw, dir, PW_ID_ANY, flags, params, 1);
+         if (rc < 0)
+@@ -2796,39 +3523,43 @@
              return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
          }
  
 -        if (FAILED(hr = stream_await_ready(stream)))
-+        if (FAILED(hr = stream_await_ready(stream, FALSE)))
++        if (wait && FAILED(hr = stream_await_ready(stream, FALSE)))
              return hr;
  
-         /* Covers the process that started with a healthy budget and was
-@@ -2823,7 +2881,7 @@
-                 WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
-                 return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
-             }
+-        /* Covers the process that started with a healthy budget and was
+-         * clamped by module-rt while this connect was in flight.  Best
+-         * effort: the promotion has already happened, so this loses the same
+-         * race described above, but it bounds the damage to one stream, and
+-         * clearing rt_render latches the decision for every later stream in
+-         * the process.  Read and written under the loop lock. */
+-        rt_time_limit(&rt_soft, &rt_hard);
+-        if ((flags & PW_STREAM_FLAG_RT_PROCESS) && rt_soft < RT_TIME_FLOOR_USEC)
+-        {
+-            rt_gate_report(rt_soft, rt_hard, TRUE);
+-            rt_render = FALSE;
+-            rc = pw_stream_disconnect(stream->pw);
+-            if (rc < 0)
+-            {
+-                WARN("pw_stream_disconnect failed for stream %p: %d.\n", stream, rc);
+-                return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+-            }
+-            rc = pw_stream_connect(stream->pw, dir, PW_ID_ANY,
+-                                   flags & ~PW_STREAM_FLAG_RT_PROCESS, params, 1);
+-            if (rc < 0)
+-            {
+-                WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
+-                return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+-            }
 -            if (FAILED(hr = stream_await_ready(stream)))
-+            if (FAILED(hr = stream_await_ready(stream, FALSE)))
-                 return hr;
-         }
+-                return hr;
+-        }
+-    }
+-
+-    report_dispatch_mode(stream, rt_render);
++    }
++
++    report_dispatch_mode(stream, data_dispatch);
++    if (presentation_enabled(stream))
++    {
++        const struct pw_properties *effective = pw_stream_get_properties(stream->pw);
++        const char *exclusive = pw_properties_get(effective, PW_KEY_NODE_EXCLUSIVE);
++        const char *lock_quantum = pw_properties_get(effective, PW_KEY_NODE_LOCK_QUANTUM);
++        const char *no_fallback = pw_properties_get(effective, "node.dont-fallback");
++        const char *no_move = pw_properties_get(effective, "node.dont-move");
++        const char *target = pw_properties_get(effective, PW_KEY_TARGET_OBJECT);
++        HRESULT hr;
++        int rc;
++
++        if (stream->presentation_async_dispatch || !lock_quantum ||
++            !pw_properties_parse_bool(lock_quantum) || !exclusive ||
++            !pw_properties_parse_bool(exclusive) || !no_fallback ||
++            !pw_properties_parse_bool(no_fallback) || !no_move ||
++            !pw_properties_parse_bool(no_move) ||
++            (device && device[0] && (!target || strcmp(target, device))))
++        {
++            ERR("exclusive event render requires exclusive synchronous dispatch\n");
++            return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        }
++        /* PAUSED only acknowledges the node proxy.  Negotiate the target with
++         * silence before Initialize can accept any application PCM. */
++        if (pw_stream_set_active(stream->pw, true) < 0)
++            return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        if (!wait) return S_OK;
++        hr = stream_await_ready(stream, TRUE);
++        rc = pw_stream_set_active(stream->pw, false);
++        if (FAILED(hr)) return hr;
++        if (rc < 0) return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
+ 
+     return S_OK;
+ }
+@@ -2898,6 +3629,7 @@
+         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->capture_ring, &size, MEM_RELEASE);
      }
-@@ -2920,9 +2978,9 @@
+     free(stream->device);
++    free(stream->app_name);
+     free(stream);
+ }
+ 
+@@ -2920,9 +3652,9 @@
          return STATUS_SUCCESS;
      }
  
@@ -1036,12 +2722,19 @@ index cae9879f234c..1b37f7a4a302 100644
          params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
          return STATUS_SUCCESS;
      }
-@@ -3007,6 +3065,16 @@
-             goto exit;
-         }
+@@ -2945,6 +3677,7 @@
+     }
+ 
+     stream->dataflow = params->flow;
++    stream->app_name = app_name_from_wstr(params->name);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+ 
+@@ -3009,7 +3742,17 @@
          stream->bufsize_frames = (SIZE_T)frames;
-+    }
-+
+     }
+ 
+-    hr = pipewire_stream_connect(stream, params->device, params->name);
 +    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
 +        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
 +    {
@@ -1050,11 +2743,84 @@ index cae9879f234c..1b37f7a4a302 100644
 +        stream->period_bytes = bufsize_bytes;
 +        stream->mmdev_period_usec = (stream->bufsize_frames * (UINT64)1000000 +
 +                                    stream->info.rate / 2) / stream->info.rate;
-     }
++    }
++
++    hr = pipewire_stream_connect(stream, TRUE);
+     if (FAILED(hr))
+         goto exit;
  
-     hr = pipewire_stream_connect(stream, params->device, params->name);
-@@ -3169,8 +3237,11 @@
+@@ -3017,10 +3760,39 @@
+ 
+     list_init(&stream->packet_free_head);
+     list_init(&stream->packet_filled_head);
++    /* pipewire_stream_connect() waits for PAUSED/STREAMING.  Inactive streams
++     * can nevertheless report add_buffer after this return, so the initial
++     * allocation uses the high-water seen here and the Start/period paths grow
++     * it once active negotiation reports a larger capacity. */
+     if (stream->dataflow == eRender)
+     {
+-        if (!size_mul(bufsize_bytes, 2, &stream->real_bufsize_bytes) ||
+-            stream->real_bufsize_bytes > UINT32_MAX)
++        SIZE_T negotiated;
++
++        if (!size_mul(bufsize_bytes, 2, &stream->real_bufsize_bytes))
++        {
++            WARN("Render buffer size overflows (%lu frames).\n",
++                 (unsigned long)stream->bufsize_frames);
++            hr = E_OUTOFMEMORY;
++            goto exit;
++        }
++        if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++            !stream->max_pw_buffer_bytes)
++            TRACE("No PipeWire add_buffer capacity was reported yet; using the "
++                  "two-period render ring until active negotiation.\n");
++        if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        {
++            if (!exclusive_render_capacity_size(stream, &negotiated))
++            {
++                WARN("Negotiated exclusive render buffer size overflows.\n");
++                hr = E_OUTOFMEMORY;
++                goto exit;
++            }
++            if (negotiated > stream->real_bufsize_bytes)
++                stream->real_bufsize_bytes = negotiated;
++        }
++        if (stream->real_bufsize_bytes > UINT32_MAX)
+         {
+             WARN("Render buffer size too large (%lu frames).\n",
+                  (unsigned long)stream->bufsize_frames);
+@@ -3034,6 +3806,18 @@
+             WARN("Out of memory allocating render buffer (%lu bytes).\n", (unsigned long)size);
+             hr = E_OUTOFMEMORY;
+         }
++        if (SUCCEEDED(hr) && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
++            !set_exclusive_latency_bound(stream))
++        {
++            WARN("Exclusive render latency bound overflows.\n");
++            hr = E_OUTOFMEMORY;
++        }
++        if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++            __atomic_store_n(&stream->pa_target_bytes,
++                             min(stream->real_bufsize_bytes,
++                                 exclusive_render_min_target(stream)), __ATOMIC_RELEASE);
+     }
+     else
+     {
+@@ -3167,10 +3951,20 @@
+         stream_journal_flush(stream);
+         TRACE("stream %p final cb_seq %u last phase %u last_error %s.\n", stream,
                stream->cb_seq, mark & 3, debugstr_a(err));
++        if (__atomic_load_n(&stream->presentation_observation_misses, __ATOMIC_RELAXED))
++            TRACE("stream %p presentation observations unavailable/uncertain %u times, last reason %#x, submit %llu.\n",
++                  stream,
++                  __atomic_load_n(&stream->presentation_observation_misses, __ATOMIC_RELAXED),
++                  __atomic_load_n(&stream->presentation_observation_last_reason, __ATOMIC_RELAXED),
++                  (unsigned long long)__atomic_load_n(&stream->presentation_submit_frames,
++                                                      __ATOMIC_RELAXED));
          if (under || over || bad)
              WARN("stream %p underran %u times, overran %u times, bad buffers %u, "
 -                 "cb_seq %u last phase %u last_error %s.\n", stream,
@@ -1067,7 +2833,7 @@ index cae9879f234c..1b37f7a4a302 100644
      }
      if (stream->period)
      {
-@@ -3187,6 +3258,7 @@
+@@ -3187,6 +3981,7 @@
          {
              list_remove(&period->entry);
              __atomic_store_n(&period->please_quit, 1, __ATOMIC_RELEASE);
@@ -1075,7 +2841,7 @@ index cae9879f234c..1b37f7a4a302 100644
              dead_period = period;
          }
      }
-@@ -3273,7 +3345,7 @@
+@@ -3273,7 +4068,7 @@
      while ((slot = cap_claim_slot(stream, &idx, &seq)))
      {
          ACPacket *p, *next;
@@ -1084,7 +2850,7 @@ index cae9879f234c..1b37f7a4a302 100644
  
          if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
          {
-@@ -3296,8 +3368,9 @@
+@@ -3296,8 +4091,9 @@
          {
              stream->held_bytes += stream->period_bytes;
          }
@@ -1096,7 +2862,7 @@ index cae9879f234c..1b37f7a4a302 100644
          /* Two kinds of loss, each attributed to the packet that follows it.
           * An eviction removes a sequence number, so an unexpected sequence
           * means audio was lost immediately before this packet.  A clamp or an
-@@ -3319,6 +3392,15 @@
+@@ -3319,6 +4115,116 @@
      }
  }
  
@@ -1105,14 +2871,115 @@ index cae9879f234c..1b37f7a4a302 100644
 +static BOOL exclusive_render_ready(struct pipewire_stream *stream)
 +{
 +    return stream->started && stream->pw && !core_dead && !stream->pending_error &&
-+           stream->held_bytes &&
-+           __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <= stream->period_bytes;
++           !__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE) &&
++           !stream->locked && stream->held_bytes &&
++           __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <=
++           exclusive_render_low_water(stream);
++}
++
++static int do_complete_recovery(struct spa_loop *loop, bool async, uint32_t seq,
++                                const void *data, size_t size, void *user_data)
++{
++    struct pipewire_stream *stream = user_data;
++
++    /* Finish on the data loop so a concurrent quantum change cannot be lost. */
++    if (__atomic_load_n(&stream->recovery.generation, __ATOMIC_ACQUIRE) !=
++        stream->recovery.attempt_generation)
++        return -EAGAIN;
++    wine_pipewire_recovery_complete(&stream->recovery);
++    return 0;
++}
++
++/* Only the Wine worker rebuilds nodes; it never waits while holding a stream
++ * pointer, since Release can remove that stream while the loop lock is dropped. */
++static BOOL recover_render_stream(struct pipewire_stream *stream)
++{
++    struct timespec ts;
++    UINT64 now, position, qpc;
++    enum pw_stream_state state;
++    HRESULT hr;
++
++    if (!__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE)) return FALSE;
++    if (stream->locked) return TRUE;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    now = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
++    if (stream->recovery.connecting)
++    {
++        state = stream->pw ? pw_stream_get_state(stream->pw, NULL) : PW_STREAM_STATE_ERROR;
++        if (core_dead || stream->pending_error || state == PW_STREAM_STATE_ERROR ||
++            state == PW_STREAM_STATE_UNCONNECTED || now >= stream->recovery.due_ns)
++            goto failed;
++        if (state != PW_STREAM_STATE_STREAMING ||
++            !__atomic_load_n(&stream->recovery.ready, __ATOMIC_ACQUIRE)) return TRUE;
++        if (FAILED(ensure_render_ring_capacity(stream))) goto failed;
++        if (!stream->started && pw_stream_set_active(stream->pw, false) < 0) goto failed;
++        if (stream_loop_locked(stream, do_complete_recovery) < 0) goto failed;
++        TRACE("stream %p rebuilt after an external quantum change.\n", stream);
++        if (stream->started && stream->event) NtSetEvent(stream->event, NULL);
++        return FALSE;
++    }
++    if (now < stream->recovery.due_ns) return TRUE;
++
++    if (!stream->recovery.failures) presentation_freeze(stream);
++    position = stream->presentation_last_position;
++    qpc = stream->presentation_last_qpc;
++    if (stream->pw)
++    {
++        spa_hook_remove(&stream->stream_listener);
++        pw_stream_destroy(stream->pw);
++        stream->pw = NULL;
++    }
++    /* Destroy crossed the native callback barrier.  The caller's buffer
++     * mapping stays allocated, but all queued data belongs to the old node. */
++    stream->graph_quantum = 0;
++    __atomic_store_n(&stream->position, NULL, __ATOMIC_RELEASE);
++    stream->recovery.attempt_generation = __atomic_load_n(&stream->recovery.generation, __ATOMIC_ACQUIRE);
++    __atomic_store_n(&stream->recovery.ready, 0, __ATOMIC_RELEASE);
++    stream->lcl_offs_bytes = stream->pa_offs_bytes = stream->held_bytes = 0;
++    __atomic_store_n(&stream->pa_held_bytes, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->pa_target_bytes,
++                     min(stream->real_bufsize_bytes, exclusive_render_min_target(stream)),
++                     __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->max_request_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->max_refill_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->max_suggested_frames, 0, __ATOMIC_RELEASE);
++    presentation_reset(stream);
++    stream->presentation_public_origin = position;
++    stream->presentation_last_position = position;
++    stream->presentation_last_qpc = qpc;
++    stream->presentation_snapshot_valid = !!qpc;
++    __atomic_store_n(&stream->presentation_reanchor_pending, TRUE, __ATOMIC_RELEASE);
++    stream->pending_error = stream->error_reported = FALSE;
++    if (core_dead || FAILED(hr = pipewire_stream_connect(stream, FALSE))) goto failed;
++    stream->recovery.connecting = TRUE;
++    stream->recovery.due_ns = now + 1000000000;
++    return TRUE;
++
++failed:
++    TRACE("stream %p quantum rebuild failure %u at %llu, core_dead=%u, error=%s.\n", stream,
++          stream->recovery.failures + 1, (unsigned long long)now, core_dead,
++          debugstr_a(stream->last_error));
++    if (stream->pw)
++    {
++        spa_hook_remove(&stream->stream_listener);
++        pw_stream_destroy(stream->pw);
++        stream->pw = NULL;
++    }
++    stream->pending_error = stream->error_reported = FALSE;
++    if (!wine_pipewire_recovery_failed(&stream->recovery, now))
++    {
++        copy_cstr(stream->last_error, sizeof(stream->last_error), "quantum recovery failed four times");
++        stream->pending_error = TRUE;
++        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++        if (stream->event) NtSetEvent(stream->event, NULL);
++    }
++    return TRUE;
 +}
 +
  static void pipewire_period_timer_loop(void *args)
  {
      struct pipewire_period *period = args;
-@@ -3334,21 +3416,44 @@
+@@ -3334,21 +4240,77 @@
          INT64 adjust = 0;
          int have_now = 0;
  
@@ -1124,15 +2991,48 @@ index cae9879f234c..1b37f7a4a302 100644
 +        {
 +            while (!__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
 +            {
-+                BOOL ready = FALSE;
++                BOOL ready = FALSE, recovering = FALSE;
 +
 +                LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
 +                {
 +                    stream_journal_flush(stream);
++                    if (recover_render_stream(stream))
++                    {
++                        recovering = __atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE) || recovering;
++                        continue;
++                    }
++                    if (presentation_consume_fault(stream))
++                    {
++                        if (stream->pw && pw_stream_set_active(stream->pw, false) < 0)
++                            WARN("stream %p could not deactivate after presentation failure.\n", stream);
++                        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++                    }
++                    if (stream->pending_error)
++                        continue;
++                    if (FAILED(ensure_render_ring_capacity(stream)))
++                    {
++                        WARN("stream %p could not grow its render ring for the negotiated "
++                             "PipeWire capacity; invalidating the stream.\n", stream);
++                        copy_cstr(stream->last_error, sizeof(stream->last_error),
++                                  "render ring growth failed");
++                        stream->pending_error = TRUE;
++                        stream->error_reported = FALSE;
++                        if (stream->pw && pw_stream_set_active(stream->pw, false) < 0)
++                            WARN("stream %p could not deactivate after render ring failure.\n", stream);
++                        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++                        continue;
++                    }
 +                    if (exclusive_render_ready(stream)) ready = TRUE;
 +                }
 +                if (ready) break;
-+                pw_thread_loop_wait(pw_loop_global);
++                if (recovering)
++                {
++                    struct timespec deadline;
++
++                    pw_thread_loop_get_time(pw_loop_global, &deadline, 25000000);
++                    pw_thread_loop_timed_wait_full(pw_loop_global, &deadline);
++                }
++                else pw_thread_loop_wait(pw_loop_global);
 +            }
 +        }
 +        if (__atomic_load_n(&period->please_quit, __ATOMIC_ACQUIRE))
@@ -1161,7 +3061,7 @@ index cae9879f234c..1b37f7a4a302 100644
                  {
                      period->timer_stream = stream;
                      period->grid_valid = FALSE;
-@@ -3424,15 +3529,25 @@
+@@ -3424,15 +4386,27 @@
  
          LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pipewire_stream, period_entry)
          {
@@ -1177,7 +3077,9 @@ index cae9879f234c..1b37f7a4a302 100644
 +                 * consumed the preceding half, not merely after a timer tick. */
 +                if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
 +                    (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
-+                    __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) > stream->period_bytes)
++                    (stream->locked ||
++                     __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) >
++                     exclusive_render_low_water(stream)))
 +                    adv = 0;
 +
                  stream->lcl_offs_bytes += adv;
@@ -1188,7 +3090,7 @@ index cae9879f234c..1b37f7a4a302 100644
              }
              else
                  pipewire_read(stream);
-@@ -3447,10 +3562,27 @@
+@@ -3447,10 +4421,27 @@
              stream_journal_flush(stream);
  
              if ((n = __atomic_load_n(&stream->underrun_count, __ATOMIC_RELAXED)) &&
@@ -1219,7 +3121,7 @@ index cae9879f234c..1b37f7a4a302 100644
              }
              if ((n = __atomic_load_n(&stream->overrun_count, __ATOMIC_RELAXED)) &&
                  !stream->overrun_logged)
-@@ -3464,7 +3596,9 @@
+@@ -3464,7 +4455,9 @@
                  WARN("stream %p first bad process buffer (count %u).\n", stream, n);
                  stream->bad_buffer_logged = TRUE;
              }
@@ -1230,7 +3132,7 @@ index cae9879f234c..1b37f7a4a302 100644
                  NtSetEvent(stream->event, NULL);
          }
  
-@@ -3478,13 +3612,17 @@
+@@ -3478,13 +4471,17 @@
  {
      static const WCHAR name[] = {'w','i','n','e','p','i','p','e','w','i','r','e','_','t','i','m','e','r',0};
      struct pipewire_period *period;
@@ -1249,7 +3151,7 @@ index cae9879f234c..1b37f7a4a302 100644
          {
              stream->period = period;
              list_add_tail(&period->streams, &stream->period_entry);
-@@ -3502,6 +3640,7 @@
+@@ -3502,6 +4499,7 @@
          return E_OUTOFMEMORY;
      }
      period->period_usec = stream->mmdev_period_usec;
@@ -1257,15 +3159,16 @@ index cae9879f234c..1b37f7a4a302 100644
      list_init(&period->streams);
      stream->period = period;
      list_add_tail(&period->streams, &stream->period_entry);
-@@ -3527,6 +3666,7 @@
+@@ -3527,6 +4525,8 @@
  {
      struct start_params *params = args;
      struct pipewire_stream *stream = handle_get_stream(params->stream);
 +    BOOL defer_started;
++    HRESULT grow_hr;
  
      TRACE("stream %p.\n", stream);
      params->result = S_OK;
-@@ -3534,7 +3674,7 @@
+@@ -3534,7 +4534,7 @@
      if (!stream_valid(stream))
      {
          pw_thread_loop_unlock(pw_loop_global);
@@ -1274,11 +3177,29 @@ index cae9879f234c..1b37f7a4a302 100644
          return STATUS_SUCCESS;
      }
  
-@@ -3552,11 +3692,16 @@
+@@ -3552,39 +4552,100 @@
          return STATUS_SUCCESS;
      }
  
-+    defer_started = stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++    if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE))
++    {
++        __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
++        pw_thread_loop_signal(pw_loop_global, false);
++        pw_thread_loop_unlock(pw_loop_global);
++        return STATUS_SUCCESS;
++    }
++
++    /* A new transport anchor does not reset accepted client data, the submit
++     * coordinate, or the latched public position. */
++    if (!presentation_reanchor(stream))
++    {
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++
++    stream->graph_quantum = 0;
++    defer_started = !stream->period && stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
 +                    stream->dataflow == eRender &&
 +                    (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
 +
@@ -1287,33 +3208,39 @@ index cae9879f234c..1b37f7a4a302 100644
 -     * already producing.  set_active still precedes add_stream_to_period so a
 -     * failed activation cannot leave the stream linked into the period. */
 -    __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
-+     * already producing.  Exclusive event render is the exception: its
-+     * callback emits silence until readiness and period registration finish. */
++     * already producing.  Only the first exclusive event Start primes silence;
++     * on resume, retained converter PCM must stay adjacent to counted frames. */
 +    if (!defer_started)
 +        __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
  
      if (pw_stream_set_active(stream->pw, true) < 0)
      {
-@@ -3568,6 +3713,14 @@
-         return STATUS_SUCCESS;
-     }
- 
-+    if (FAILED(params->result = stream_await_ready(stream, TRUE)))
-+    {
-+        if (stream->pw) pw_stream_set_active(stream->pw, false);
-+        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
-+        pw_thread_loop_unlock(pw_loop_global);
-+        return STATUS_SUCCESS;
+         /* mirrors pulse_start's failed-uncork path */
+-        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
+         WARN("pw_stream_set_active failed for stream %p.\n", stream);
+         params->result = E_FAIL;
+-        pw_thread_loop_unlock(pw_loop_global);
+-        return STATUS_SUCCESS;
++        goto failed;
 +    }
 +
++    if (FAILED(params->result = stream_await_ready(stream, TRUE)))
++        goto failed;
++
++    if (FAILED(grow_hr = ensure_render_ring_capacity(stream)))
++    {
++        params->result = grow_hr;
++        goto failed;
+     }
+ 
      if (FAILED(params->result = pipewire_add_stream_to_period(stream)))
-     {
-         if (pw_stream_set_active(stream->pw, false) < 0)
-@@ -3575,6 +3728,17 @@
-         __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
-         pw_thread_loop_unlock(pw_loop_global);
-         return STATUS_SUCCESS;
-+    }
+-    {
+-        if (pw_stream_set_active(stream->pw, false) < 0)
+-            WARN("pw_stream_set_active(false) rollback failed for stream %p.\n", stream);
+-        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
+-        pw_thread_loop_unlock(pw_loop_global);
+-        return STATUS_SUCCESS;
++        goto failed;
 +
 +    if (defer_started)
 +        __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
@@ -1321,13 +3248,293 @@ index cae9879f234c..1b37f7a4a302 100644
 +    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->event)
 +    {
 +        if (!stream->held_bytes &&
-+            __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <= stream->period_bytes)
++            __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE) <=
++            exclusive_render_low_water(stream))
 +            NtSetEvent(stream->event, NULL);
 +        pw_thread_loop_signal(pw_loop_global, false);
      }
  
      pw_thread_loop_unlock(pw_loop_global);
-@@ -3847,6 +4011,15 @@
+     return STATUS_SUCCESS;
++
++failed:
++    if (stream->pw && pw_stream_set_active(stream->pw, false) < 0)
++    {
++        WARN("pw_stream_set_active(false) rollback failed for stream %p.\n", stream);
++        copy_cstr(stream->last_error, sizeof(stream->last_error), "Start rollback failed");
++        stream->pending_error = TRUE;
++        stream->error_reported = FALSE;
++    }
++    __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++    if (!defer_started && presentation_enabled(stream))
++    {
++        /* A failed resume may already have consumed retained or client PCM. */
++        stream->presentation_resume_origin_valid = FALSE;
++        __atomic_store_n(&stream->presentation_resume_uncertain, TRUE, __ATOMIC_RELEASE);
++    }
++    pw_thread_loop_unlock(pw_loop_global);
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS pipewire_stop(void *args)
+ {
+     struct stop_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
++    UINT64 pre_submit = 0, pre_queued = 0, pre_buffered = 0, pre_origin = 0;
++    UINT64 post_submit = 0, post_queued = 0, post_buffered = 0, post_origin = 0;
++    int pre_time_result, post_time_result = -ENODEV;
++    enum pw_stream_state pre_state, post_state = PW_STREAM_STATE_ERROR;
++    BOOL pre_valid, post_valid;
++    BOOL frozen;
++    int active_result;
+ 
+     TRACE("stream %p.\n", stream);
+     pw_thread_loop_lock(pw_loop_global);
+@@ -3602,13 +4663,74 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (pw_stream_set_active(stream->pw, false) < 0)
++    if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE))
++    {
++        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++        pw_thread_loop_signal(pw_loop_global, false);
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++
++    /* Latch the public endpoint before deactivation.  The native queue may
++     * remain live internally while Stop crosses the PipeWire barrier, but
++     * that interval must not advance the public timeline. */
++    frozen = presentation_freeze(stream) &&
++             !__atomic_load_n(&stream->presentation_resume_uncertain, __ATOMIC_ACQUIRE);
++    pre_valid = presentation_read_resume_origin(stream, &pre_submit, &pre_queued,
++                                                &pre_buffered, &pre_origin, FALSE,
++                                                &pre_time_result, &pre_state);
++    TRACE("presentation resume stop pre valid=%u result=%d state=%d submit=%llu queued=%llu buffered=%llu origin=%llu.\n",
++          pre_valid, pre_time_result, pre_state, (unsigned long long)pre_submit,
++          (unsigned long long)pre_queued,
++          (unsigned long long)pre_buffered, (unsigned long long)pre_origin);
++    __atomic_store_n(&stream->presentation_resume_uncertain, TRUE, __ATOMIC_RELEASE);
++    active_result = pw_stream_set_active(stream->pw, false);
++    if (active_result < 0)
+         WARN("pw_stream_set_active(false) failed for stream %p.\n", stream);
+     /* after set_active(false): its data-loop barrier has drained any
+      * in-flight callback, so no reader can still observe started=TRUE */
++    post_valid = active_result >= 0 &&
++                 presentation_read_resume_origin(stream, &post_submit, &post_queued,
++                                                 &post_buffered, &post_origin, TRUE,
++                                                 &post_time_result, &post_state);
++    /* Async graph output can survive Stop outside the public queued/buffered extent. */
++    if (post_valid && stream->presentation_async_dispatch && post_submit)
++        post_valid = FALSE;
++    /* Priming silence has no public frames to retain or discard. */
++    if (active_result >= 0 && presentation_enabled(stream) &&
++        !__atomic_load_n(&stream->presentation_submit_frames, __ATOMIC_ACQUIRE))
++    {
++        post_origin = 0;
++        post_valid = TRUE;
++    }
++    TRACE("presentation resume stop post valid=%u frozen=%u result=%d state=%d submit=%llu queued=%llu buffered=%llu origin=%llu.\n",
++          post_valid, frozen, post_time_result, post_state, (unsigned long long)post_submit,
++          (unsigned long long)post_queued, (unsigned long long)post_buffered,
++          (unsigned long long)post_origin);
++    if (post_valid && frozen)
++    {
++        stream->presentation_resume_origin = post_origin;
++        stream->presentation_resume_origin_valid = TRUE;
++    }
++    else
++    {
++        stream->presentation_resume_origin_valid = FALSE;
++        stream->presentation_resume_origin = 0;
++    }
++    if (post_valid && frozen)
++        __atomic_store_n(&stream->presentation_resume_uncertain, FALSE, __ATOMIC_RELEASE);
+     __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++    if (active_result < 0 || (presentation_enabled(stream) && (!post_valid || !frozen)))
++    {
++        copy_cstr(stream->last_error, sizeof(stream->last_error), "Stop retained frontier unavailable");
++        stream->pending_error = TRUE;
++        stream->error_reported = FALSE;
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    }
++    else
++        params->result = S_OK;
+     pw_thread_loop_unlock(pw_loop_global);
+-    params->result = S_OK;
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -3628,7 +4750,8 @@
+  * cursors were not touched, so no caller may publish state assuming the step
+  * ran.  -ENODEV is a pw_stream already destroyed by a core reconnect, which
+  * callers map to a different HRESULT. */
+-static int stream_loop_locked(struct pipewire_stream *stream, spa_invoke_func_t fn)
++static int stream_loop_locked_data(struct pipewire_stream *stream, spa_invoke_func_t fn,
++                                   void *user_data)
+ {
+     struct pw_loop *data_loop;
+ 
+@@ -3636,9 +4759,14 @@
+         return -ENODEV;
+ 
+     if (data_loop == pw_thread_loop_get_loop(pw_loop_global))
+-        return fn(data_loop->loop, false, 0, NULL, 0, stream);
+-
+-    return pw_loop_invoke(data_loop, fn, 0, NULL, 0, true, stream);
++        return fn(data_loop->loop, false, 0, NULL, 0, user_data);
++
++    return pw_loop_invoke(data_loop, fn, 0, NULL, 0, true, user_data);
++}
++
++static int stream_loop_locked(struct pipewire_stream *stream, spa_invoke_func_t fn)
++{
++    return stream_loop_locked_data(stream, fn, stream);
+ }
+ 
+ /* The device is gone only when the stream object itself is; a loop that could
+@@ -3690,6 +4818,106 @@
+     return 0;
+ }
+ 
++struct render_ring_rebase
++{
++    struct pipewire_stream *stream;
++    BYTE *new_buffer;
++    SIZE_T new_size;
++    BYTE *old_buffer;
++};
++
++/* Runs with the process callback excluded.  The callback owns pa_offs, so
++ * copy and rebase the native view here before control swaps the mapping. */
++static int do_grow_render_ring(struct spa_loop *loop, bool async, uint32_t seq,
++                               const void *data, size_t size, void *user_data)
++{
++    struct render_ring_rebase *rebase = user_data;
++    struct pipewire_stream *stream = rebase->stream;
++    SIZE_T pa_held, held;
++
++    if (!stream->local_buffer || !stream->real_bufsize_bytes ||
++        stream->pa_offs_bytes >= stream->real_bufsize_bytes ||
++        !rebase->new_buffer || rebase->new_size <= stream->real_bufsize_bytes ||
++        rebase->new_size > UINT32_MAX)
++        return -EINVAL;
++
++    pa_held = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
++    if (pa_held > stream->real_bufsize_bytes)
++        return -EOVERFLOW;
++    held = stream->held_bytes;
++    if (held > rebase->new_size)
++        return -EOVERFLOW;
++
++    copy_from_ring(rebase->new_buffer, stream->local_buffer,
++                   stream->real_bufsize_bytes, stream->pa_offs_bytes, pa_held);
++    rebase->old_buffer = stream->local_buffer;
++    stream->local_buffer = rebase->new_buffer;
++    stream->real_bufsize_bytes = rebase->new_size;
++    stream->pa_offs_bytes = 0;
++    if (pa_held >= held)
++        stream->lcl_offs_bytes = pa_held - held;
++    else
++        stream->lcl_offs_bytes = rebase->new_size - (held - pa_held);
++    stream->lcl_offs_bytes %= rebase->new_size;
++    return 0;
++}
++
++/* Called with the thread-loop lock held.  Allocation stays on this control
++ * path; the data-loop invoke above is the only code that touches pa_offs. */
++static HRESULT ensure_render_ring_capacity(struct pipewire_stream *stream)
++{
++    struct render_ring_rebase rebase;
++    SIZE_T required, demand, size;
++    int res;
++
++    if (stream->share != AUDCLNT_SHAREMODE_EXCLUSIVE ||
++        !(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        return S_OK;
++    if (!exclusive_render_capacity_size(stream, &required))
++        return E_OUTOFMEMORY;
++    if (!exclusive_render_demand_size(stream, &demand))
++        return E_OUTOFMEMORY;
++    if (!stream->latency_bound_bytes || demand > stream->latency_bound_bytes)
++        return AUDCLNT_E_BUFFER_SIZE_ERROR;
++    if (demand > required)
++        required = demand;
++    if (required > stream->latency_bound_bytes)
++        required = stream->latency_bound_bytes;
++    if (required <= stream->real_bufsize_bytes)
++        return S_OK;
++    if (stream->locked)
++        return S_FALSE;
++    if (required > UINT32_MAX)
++        return E_OUTOFMEMORY;
++
++    rebase.stream = stream;
++    rebase.new_buffer = NULL;
++    rebase.new_size = required;
++    rebase.old_buffer = NULL;
++    size = required;
++    if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&rebase.new_buffer,
++                                zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
++    {
++        WARN("Out of memory growing render buffer to %llu bytes.\n",
++             (unsigned long long)required);
++        return E_OUTOFMEMORY;
++    }
++
++    res = stream_loop_locked_data(stream, do_grow_render_ring, &rebase);
++    if (res < 0 || !rebase.old_buffer)
++    {
++        size = 0;
++        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&rebase.new_buffer, &size, MEM_RELEASE);
++        return res < 0 ? ring_op_hresult(res) : AUDCLNT_E_SERVICE_NOT_RUNNING;
++    }
++
++    size = 0;
++    NtFreeVirtualMemory(GetCurrentProcess(), (void **)&rebase.old_buffer, &size, MEM_RELEASE);
++    TRACE("stream %p grew render ring to %llu bytes.\n", stream,
++          (unsigned long long)required);
++    return S_OK;
++}
++
+ static NTSTATUS pipewire_reset(void *args)
+ {
+     struct reset_params *params = args;
+@@ -3719,7 +4947,7 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (pw_stream_flush(stream->pw, false) < 0)
++    if (stream->pw && pw_stream_flush(stream->pw, false) < 0)
+         WARN("pw_stream_flush failed for stream %p.\n", stream);
+ 
+     if (stream->dataflow == eRender)
+@@ -3727,7 +4955,8 @@
+         /* Clear the read cursor before the cursors that describe it, so a
+          * failed marshal leaves every one of them as it was rather than a
+          * zeroed half. */
+-        int res = stream_loop_locked(stream, do_reset_ring);
++        int res = !stream->pw && __atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE) ?
++                  do_reset_ring(NULL, false, 0, NULL, 0, stream) : stream_loop_locked(stream, do_reset_ring);
+ 
+         if (res < 0)
+         {
+@@ -3739,6 +4968,12 @@
+         stream->clock_lastpos = stream->clock_written = 0;
+         stream->lcl_offs_bytes = 0;
+         stream->held_bytes = 0;
++        presentation_reset(stream);
++        if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
++            (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++            __atomic_store_n(&stream->pa_target_bytes,
++                             min(stream->real_bufsize_bytes,
++                                 exclusive_render_min_target(stream)), __ATOMIC_RELEASE);
+     }
+     else
+     {
+@@ -3847,6 +5082,15 @@
          return STATUS_SUCCESS;
      }
  
@@ -1343,7 +3550,7 @@ index cae9879f234c..1b37f7a4a302 100644
      if (stream->held_bytes / stream->frame_size + params->frames > stream->bufsize_frames)
      {
          pw_thread_loop_unlock(pw_loop_global);
-@@ -3905,6 +4078,21 @@
+@@ -3905,6 +5149,21 @@
      BYTE *buffer;
  
      pw_thread_loop_lock(pw_loop_global);
@@ -1365,7 +3572,23 @@ index cae9879f234c..1b37f7a4a302 100644
      if (!stream->locked || !params->written_frames)
      {
          stream->locked = 0;
-@@ -3964,6 +4152,9 @@
+@@ -3920,6 +5179,15 @@
+     {
+         pw_thread_loop_unlock(pw_loop_global);
+         params->result = AUDCLNT_E_INVALID_SIZE;
++        return STATUS_SUCCESS;
++    }
++
++    if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE))
++    {
++        stream->locked = 0;
++        pw_thread_loop_signal(pw_loop_global, false);
++        pw_thread_loop_unlock(pw_loop_global);
++        params->result = S_OK;
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -3964,6 +5232,9 @@
          __atomic_add_fetch(&stream->pa_held_bytes, written_bytes, __ATOMIC_RELEASE);
      stream->clock_written += written_bytes;
      stream->locked = 0;
@@ -1375,7 +3598,24 @@ index cae9879f234c..1b37f7a4a302 100644
  
      pw_thread_loop_unlock(pw_loop_global);
      params->result = S_OK;
-@@ -4153,6 +4344,8 @@
+@@ -4106,8 +5377,14 @@
+         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+         return STATUS_SUCCESS;
+     }
+-    lat = stream->period_bytes / stream->frame_size;
+-    *params->latency = (lat * 10000000) / stream->info.rate + stream->def_period;
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->dataflow == eRender &&
++        (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        *params->latency = stream->latency_bound;
++    else
++    {
++        lat = stream->period_bytes / stream->frame_size;
++        *params->latency = (lat * 10000000) / stream->info.rate + stream->def_period;
++    }
+     TRACE("stream %p latency %u ms.\n", stream, (unsigned)(*params->latency / 10000));
+     pw_thread_loop_unlock(pw_loop_global);
+     params->result = S_OK;
+@@ -4153,14 +5430,71 @@
      if (stream->share == AUDCLNT_SHAREMODE_SHARED)
          *params->freq *= stream->frame_size;
      pw_thread_loop_unlock(pw_loop_global);
@@ -1384,7 +3624,62 @@ index cae9879f234c..1b37f7a4a302 100644
      params->result = S_OK;
      return STATUS_SUCCESS;
  }
-@@ -4161,6 +4354,7 @@
+ 
++static HRESULT presentation_get_position_locked(struct pipewire_stream *stream,
++                                                UINT64 *position, UINT64 *qpc_100ns)
++{
++    UINT64 now_ns, now_qpc;
++    BOOL timing_uncertain;
++
++    if (__atomic_load_n(&stream->recovery.pending, __ATOMIC_ACQUIRE))
++    {
++        *position = stream->presentation_last_position;
++        *qpc_100ns = stream->presentation_last_qpc;
++        return S_FALSE;
++    }
++
++    timing_uncertain = __atomic_load_n(&stream->presentation_observation_last_reason,
++                                       __ATOMIC_ACQUIRE) != 0 ||
++                       __atomic_load_n(&stream->presentation_resume_uncertain, __ATOMIC_ACQUIRE);
++    if (presentation_project(stream, position, qpc_100ns))
++        return timing_uncertain ? S_FALSE : S_OK;
++    if (__atomic_load_n(&stream->presentation_resume_uncertain, __ATOMIC_ACQUIRE) &&
++        stream->presentation_snapshot_valid)
++    {
++        *position = stream->presentation_last_position;
++        *qpc_100ns = stream->presentation_last_qpc;
++        return S_FALSE;
++    }
++    if (__atomic_load_n(&stream->presentation_reanchor_pending, __ATOMIC_ACQUIRE) &&
++        stream->started)
++    {
++        if (!presentation_clock_now(&now_ns, &now_qpc))
++            now_qpc = stream->presentation_last_qpc;
++        *position = stream->presentation_last_position;
++        *qpc_100ns = now_qpc;
++        return S_FALSE;
++    }
++    if (stream->presentation_snapshot_valid)
++    {
++        *position = stream->presentation_last_position;
++        *qpc_100ns = stream->presentation_last_qpc;
++        return S_FALSE;
++    }
++    /* No anchor exists yet.  A zero position paired with the current QPC is
++     * valid before the first transport span; it never exposes a future T0. */
++    if (!presentation_clock_now(&now_ns, &now_qpc))
++        now_qpc = 0;
++    *position = stream->presentation_last_position;
++    *qpc_100ns = now_qpc;
++    if (now_qpc)
++    {
++        stream->presentation_last_qpc = now_qpc;
++        stream->presentation_snapshot_valid = TRUE;
++    }
++    return S_FALSE;
++}
++
+ static NTSTATUS pipewire_get_position(void *args)
  {
      struct get_position_params *params = args;
      struct pipewire_stream *stream = handle_get_stream(params->stream);
@@ -1392,11 +3687,27 @@ index cae9879f234c..1b37f7a4a302 100644
  
      pw_thread_loop_lock(pw_loop_global);
      if (!stream_valid(stream))
-@@ -4170,7 +4364,13 @@
+@@ -4170,7 +5504,29 @@
          return STATUS_SUCCESS;
      }
  
 -    *params->pos = stream->clock_written - stream->held_bytes;
++    if (presentation_enabled(stream))
++    {
++        UINT64 qpc = 0;
++        HRESULT result = presentation_get_position_locked(stream, params->pos, &qpc);
++
++        if (params->qpctime)
++            *params->qpctime = qpc;
++        pw_thread_loop_unlock(pw_loop_global);
++        TRACE_(pipewire_clock)("stream %p, device %u, position %llu, qpc %llu, qpc_present %u, result %#lx.\n",
++                stream, params->device, (unsigned long long)*params->pos,
++                params->qpctime ? (unsigned long long)*params->qpctime : 0,
++                !!params->qpctime, (unsigned long)result);
++        params->result = result;
++        return STATUS_SUCCESS;
++    }
++
 +    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE && stream->dataflow == eRender)
 +    {
 +        queued = __atomic_load_n(&stream->pa_held_bytes, __ATOMIC_ACQUIRE);
@@ -1407,7 +3718,7 @@ index cae9879f234c..1b37f7a4a302 100644
  
      if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
          *params->pos /= stream->frame_size;
-@@ -4183,11 +4383,15 @@
+@@ -4183,11 +5539,15 @@
  
      if (params->qpctime)
      {
@@ -1428,3 +3739,443 @@ index cae9879f234c..1b37f7a4a302 100644
      params->result = S_OK;
      return STATUS_SUCCESS;
  }
+@@ -4253,6 +5613,11 @@
+         hr = E_NOTIMPL;
+         goto exit;
+     }
++    if (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++    {
++        hr = E_NOTIMPL;
++        goto exit;
++    }
+     if (stream->locked)
+     {
+         hr = AUDCLNT_E_BUFFER_OPERATION_PENDING;
+@@ -4278,7 +5643,6 @@
+         hr = E_INVALIDARG;
+         goto exit;
+     }
+-
+     /* Empty the ring before changing the rate.  The control cannot be put
+      * back once set, so the step that can fail comes first: if the read
+      * cursor cannot be reached, nothing has moved and the stream is still
+diff --git a/dlls/winepipewire.drv/presentation.c b/dlls/winepipewire.drv/presentation.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/winepipewire.drv/presentation.c
+@@ -0,0 +1,151 @@
++/*
++ * Bounded presentation math for the PipeWire WASAPI render adapter.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include <limits.h>
++
++#include "presentation.h"
++#include "wine/audio_presentation.h"
++
++static int add_u64(uint64_t a, uint64_t b, uint64_t *out)
++{
++    if (a > UINT64_MAX - b)
++        return 0;
++    *out = a + b;
++    return 1;
++}
++
++static int mul_div_u64(uint64_t a, uint32_t b, uint32_t denominator, uint64_t *out)
++{
++    uint64_t quotient, remainder;
++
++    if (!denominator)
++        return 0;
++    quotient = a / denominator;
++    if (b && quotient > UINT64_MAX / b)
++        return 0;
++    /* The remainder and multiplier are both 32-bit, so their product fits. */
++    remainder = (a % denominator) * b / denominator;
++    return add_u64(quotient * b, remainder, out);
++}
++
++static int mul_div_u64_ceil(uint64_t a, uint32_t b, uint32_t denominator, uint64_t *out)
++{
++    uint64_t result;
++
++    if (!mul_div_u64(a, b, denominator, &result))
++        return 0;
++    return add_u64(result, ((a % denominator) * b % denominator) != 0, out);
++}
++
++int wine_presentation_first_ns(const struct wine_presentation_observation *observation,
++                               uint64_t *first_ns)
++{
++    if (!observation || !first_ns)
++        return 0;
++    return audio_presentation_first_ns(observation->now_ns, observation->queued_frames,
++                                       observation->buffered_frames, observation->delay_ticks,
++                                       observation->rate_num, observation->rate_denom,
++                                       observation->stream_rate, first_ns);
++}
++
++int wine_presentation_resume_origin(uint64_t submit_frames, uint64_t queued_frames,
++                                    uint64_t buffered_frames, uint64_t *native_origin)
++{
++    uint64_t pending;
++
++    if (!native_origin || queued_frames > UINT64_MAX - buffered_frames)
++        return 0;
++    pending = queued_frames + buffered_frames;
++    if (pending > submit_frames)
++        return 0;
++    *native_origin = submit_frames - pending;
++    return 1;
++}
++
++int wine_presentation_reanchor(uint64_t old_native, uint64_t old_public,
++                                uint64_t next_native, uint64_t *next_public)
++{
++    return next_public && next_native >= old_native &&
++           add_u64(old_public, next_native - old_native, next_public);
++}
++
++int wine_presentation_span_end(uint64_t first_ns, uint32_t frames, uint32_t stream_rate,
++                               uint64_t *end_ns)
++{
++    uint64_t duration;
++
++    if (!end_ns || !frames || !stream_rate ||
++        !mul_div_u64(frames, 1000000000, stream_rate, &duration) ||
++        !add_u64(first_ns, duration, end_ns))
++        return 0;
++    return 1;
++}
++
++int wine_presentation_project_basis(const struct wine_presentation_basis *basis,
++                                    uint64_t now_ns, uint64_t *position)
++{
++    uint64_t before_frames, elapsed_frames, native_position, native_delta;
++    uint64_t span_frames;
++    uint64_t frames;
++
++    if (!basis || !position || !basis->stream_rate ||
++        basis->native_origin > basis->submit_start ||
++        basis->submit_end < basis->submit_start || basis->end_ns < basis->first_ns)
++        return 0;
++
++    span_frames = basis->submit_end - basis->submit_start;
++    if (now_ns < basis->first_ns)
++    {
++        if (!mul_div_u64_ceil(basis->first_ns - now_ns, basis->stream_rate,
++                              1000000000, &before_frames))
++            return 0;
++        native_position = before_frames >= basis->submit_start - basis->native_origin ?
++                          basis->native_origin : basis->submit_start - before_frames;
++    }
++    else if (now_ns >= basis->end_ns)
++    {
++        native_position = basis->submit_end;
++    }
++    else
++    {
++        if (!mul_div_u64(now_ns - basis->first_ns, basis->stream_rate,
++                         1000000000, &frames))
++            return 0;
++        elapsed_frames = frames > span_frames ? span_frames : (uint64_t)frames;
++        native_position = basis->submit_start + elapsed_frames;
++    }
++
++    native_delta = native_position - basis->native_origin;
++    if (!add_u64(basis->public_origin, native_delta, position))
++        return 0;
++    return 1;
++}
++
++int wine_presentation_span_contiguous(const struct wine_presentation_observation *previous,
++                                      const struct wine_presentation_observation *current,
++                                      uint64_t previous_end_ns, uint64_t current_first_ns)
++{
++    uint64_t tolerance_ns;
++
++    if (!previous || !current || !previous->stream_rate ||
++        previous->stream_rate != current->stream_rate ||
++        previous->rate_num != current->rate_num ||
++        previous->rate_denom != current->rate_denom ||
++        current->now_ns < previous->now_ns)
++        return 0;
++    if (current_first_ns >= previous_end_ns)
++        return 1;
++    tolerance_ns = ((uint64_t)1000000000 + previous->stream_rate - 1) /
++                   previous->stream_rate;
++    return previous_end_ns - current_first_ns <= tolerance_ns;
++}
+diff --git a/dlls/winepipewire.drv/presentation.h b/dlls/winepipewire.drv/presentation.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/winepipewire.drv/presentation.h
+@@ -0,0 +1,52 @@
++/*
++ * Bounded presentation math for the PipeWire WASAPI render adapter.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef WINE_PIPEWIRE_PRESENTATION_H
++#define WINE_PIPEWIRE_PRESENTATION_H
++
++#include <stdint.h>
++
++struct wine_presentation_observation
++{
++    int64_t now_ns;
++    uint64_t queued_frames;
++    uint64_t buffered_frames;
++    int64_t delay_ticks;
++    uint32_t rate_num;
++    uint32_t rate_denom;
++    uint32_t stream_rate;
++};
++
++struct wine_presentation_basis
++{
++    uint64_t epoch;
++    uint64_t submit_start;
++    uint64_t submit_end;
++    uint64_t native_origin;
++    uint64_t public_origin;
++    uint64_t first_ns;
++    uint64_t end_ns;
++    uint32_t stream_rate;
++};
++
++int wine_presentation_first_ns(const struct wine_presentation_observation *observation,
++                               uint64_t *first_ns);
++int wine_presentation_resume_origin(uint64_t submit_frames, uint64_t queued_frames,
++                                    uint64_t buffered_frames, uint64_t *native_origin);
++int wine_presentation_reanchor(uint64_t old_native, uint64_t old_public,
++                                uint64_t next_native, uint64_t *next_public);
++int wine_presentation_span_end(uint64_t first_ns, uint32_t frames, uint32_t stream_rate,
++                               uint64_t *end_ns);
++int wine_presentation_project_basis(const struct wine_presentation_basis *basis,
++                                    uint64_t now_ns, uint64_t *position);
++int wine_presentation_span_contiguous(const struct wine_presentation_observation *previous,
++                                      const struct wine_presentation_observation *current,
++                                      uint64_t previous_end_ns, uint64_t current_first_ns);
++
++#endif
+diff --git a/include/Makefile.in b/include/Makefile.in
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -962,6 +962,7 @@
+ 	wine/afd.h \
+ 	wine/asm.h \
+ 	wine/atsvc.idl \
++	wine/audio_presentation.h \
+ 	wine/condrv.h \
+ 	wine/dcetypes.idl \
+ 	wine/debug.h \
+diff --git a/include/wine/audio_presentation.h b/include/wine/audio_presentation.h
+new file mode 100644
+--- /dev/null
++++ b/include/wine/audio_presentation.h
+@@ -0,0 +1,145 @@
++/* Checked audio presentation arithmetic. LGPL-2.1-or-later. */
++#ifndef __WINE_AUDIO_PRESENTATION_H
++#define __WINE_AUDIO_PRESENTATION_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/* 32-bit limbs preserve wide intermediates on native i386 as well as x64. */
++struct audio_presentation_wide
++{
++    uint32_t words[4];
++};
++
++static inline struct audio_presentation_wide audio_presentation_wide_from(uint64_t value)
++{
++    struct audio_presentation_wide result = {{(uint32_t)value, (uint32_t)(value >> 32), 0, 0}};
++    return result;
++}
++
++static inline bool audio_presentation_wide_add(struct audio_presentation_wide a,
++                                              struct audio_presentation_wide b,
++                                              struct audio_presentation_wide *result)
++{
++    uint64_t carry = 0;
++    unsigned int i;
++
++    for (i = 0; i < 4; ++i)
++    {
++        carry += (uint64_t)a.words[i] + b.words[i];
++        result->words[i] = carry;
++        carry >>= 32;
++    }
++    return !carry;
++}
++
++static inline bool audio_presentation_wide_sub(struct audio_presentation_wide a,
++                                              struct audio_presentation_wide b,
++                                              struct audio_presentation_wide *result)
++{
++    uint64_t subtrahend;
++    unsigned int i, borrow = 0;
++
++    for (i = 0; i < 4; ++i)
++    {
++        subtrahend = (uint64_t)b.words[i] + borrow;
++        result->words[i] = a.words[i] - subtrahend;
++        borrow = a.words[i] < subtrahend;
++    }
++    return !borrow;
++}
++
++static inline bool audio_presentation_wide_mul(struct audio_presentation_wide *value,
++                                              uint32_t multiplier)
++{
++    uint64_t carry = 0;
++    unsigned int i;
++
++    for (i = 0; i < 4; ++i)
++    {
++        carry += (uint64_t)value->words[i] * multiplier;
++        value->words[i] = carry;
++        carry >>= 32;
++    }
++    return !carry;
++}
++
++/* Callers validate the divisor before entering the limb division. */
++static inline uint32_t audio_presentation_wide_div(struct audio_presentation_wide *value,
++                                                  uint32_t divisor)
++{
++    uint64_t partial, remainder = 0;
++    unsigned int i;
++
++    for (i = 4; i-- > 0;)
++    {
++        partial = (remainder << 32) | value->words[i];
++        value->words[i] = partial / divisor;
++        remainder = partial % divisor;
++    }
++    return remainder;
++}
++
++static inline bool audio_presentation_wide_u64(struct audio_presentation_wide value,
++                                              uint64_t *result)
++{
++    if (value.words[2] || value.words[3]) return false;
++    *result = ((uint64_t)value.words[1] << 32) | value.words[0];
++    return true;
++}
++
++/* queued and buffered are stream frames; delay is in graph ticks. */
++static inline bool audio_presentation_first_ns(int64_t now, uint64_t queued, uint64_t buffered,
++                                               int64_t delay, uint32_t period_num,
++                                               uint32_t period_denom, uint32_t stream_rate,
++                                               uint64_t *first)
++{
++    struct audio_presentation_wide result, pending, graph_delay;
++    uint64_t magnitude = delay, ns;
++
++    if (now <= 0 || !period_num || !period_denom || !stream_rate || !first)
++        return false;
++    result = audio_presentation_wide_from(now);
++    pending = audio_presentation_wide_from(queued);
++    if (!audio_presentation_wide_add(pending, audio_presentation_wide_from(buffered), &pending)
++        || !audio_presentation_wide_mul(&pending, 1000000000)) return false;
++    audio_presentation_wide_div(&pending, stream_rate);
++    if (delay < 0) magnitude = 0 - magnitude;
++    graph_delay = audio_presentation_wide_from(magnitude);
++    if (!audio_presentation_wide_mul(&graph_delay, period_num)
++        || !audio_presentation_wide_mul(&graph_delay, 1000000000)) return false;
++    audio_presentation_wide_div(&graph_delay, period_denom);
++    if (!audio_presentation_wide_add(result, pending, &result)) return false;
++    if (delay < 0)
++    {
++        if (!audio_presentation_wide_sub(result, graph_delay, &result)) return false;
++    }
++    else if (!audio_presentation_wide_add(result, graph_delay, &result)) return false;
++    if (!audio_presentation_wide_u64(result, &ns) || !ns) return false;
++    *first = ns;
++    return true;
++}
++
++static inline bool audio_presentation_time_at(uint64_t reference_frame, uint64_t reference_ns,
++                                              uint64_t target_frame, uint32_t rate, uint64_t *ns)
++{
++    struct audio_presentation_wide result = audio_presentation_wide_from(reference_ns);
++    struct audio_presentation_wide delta;
++    uint64_t value;
++
++    if (!rate || !ns) return false;
++    delta = audio_presentation_wide_from(target_frame >= reference_frame
++        ? target_frame - reference_frame : reference_frame - target_frame);
++    if (!audio_presentation_wide_mul(&delta, 1000000000)) return false;
++    audio_presentation_wide_div(&delta, rate);
++    if (target_frame >= reference_frame)
++    {
++        if (!audio_presentation_wide_add(result, delta, &result)) return false;
++    }
++    else if (!audio_presentation_wide_sub(result, delta, &result)) return false;
++    if (!audio_presentation_wide_u64(result, &value) || !value) return false;
++    *ns = value;
++    return true;
++}
++
++#endif
+
+diff --git a/dlls/winepipewire.drv/recovery.h b/dlls/winepipewire.drv/recovery.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/winepipewire.drv/recovery.h
+@@ -0,0 +1,40 @@
++/* Bounded retries for a stream rebuilt after an external graph change. */
++#ifndef __WINE_PIPEWIRE_RECOVERY_H
++#define __WINE_PIPEWIRE_RECOVERY_H
++
++#include <stdint.h>
++
++struct wine_pipewire_recovery
++{
++    unsigned int pending; /* atomic: callback requests, Wine worker completes */
++    unsigned int ready; /* atomic: the replacement node has processed a valid span */
++    unsigned int generation; /* atomic: external quantum changes */
++    unsigned int attempt_generation;
++    unsigned int failures;
++    int connecting;
++    uint64_t due_ns;
++};
++
++static inline int wine_pipewire_recovery_failed(struct wine_pipewire_recovery *state, uint64_t now)
++{
++    state->connecting = 0;
++    __atomic_store_n(&state->ready, 0, __ATOMIC_RELEASE);
++    if (++state->failures > 3)
++    {
++        __atomic_store_n(&state->pending, 0, __ATOMIC_RELEASE);
++        return 0;
++    }
++    state->due_ns = now + (UINT64_C(100000000) << (state->failures - 1));
++    return 1;
++}
++
++static inline void wine_pipewire_recovery_complete(struct wine_pipewire_recovery *state)
++{
++    state->failures = 0;
++    state->connecting = 0;
++    state->due_ns = 0;
++    __atomic_store_n(&state->ready, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&state->pending, 0, __ATOMIC_RELEASE);
++}
++
++#endif
